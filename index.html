@@ -66,8 +66,8 @@
   <h2 style="margin-top:4px">Emergent behaviour (measured from what bots do)</h2>
   <div class="grid" id="patterns"></div>
   <div class="charts2" id="pattern-charts"></div>
-  <h2>Learning &amp; Heritage</h2>
-  <div class="s" style="font-size:12px;color:#9ab;margin-bottom:6px">Each bot has genes plus a small learned layer that changes with food rewards during its life. Children get a share of their parent's learned layer (teaching), can copy their parent while young (apprenticeship), and families can mark landmarks.</div>
+  <h2>Families &amp; Heritage</h2>
+  <div class="s" style="font-size:12px;color:#9ab;margin-bottom:6px">Each bot's behaviour comes from its genes (a small brain plus speed, vision and size), passed to children with small mutations. Bots do not learn during their lifetime and nothing is taught; families can mark landmarks. When everyone dies, the world restarts from the best past brains plus one brand-new random bot.</div>
   <div class="grid" id="her-cards"></div>
   <div class="charts2" id="her-charts"></div>
   <h2>Caves</h2>
@@ -105,7 +105,7 @@ const LS_KEY = 'botworld-v' + BotSim.VERSION;
 const TRAITS = BotSim.TRAITS, METRICS = ST.METRICS, PATTERNS = ST.PATTERNS;
 const SEASON_BAND = ['rgba(120,220,140,.10)', 'rgba(255,220,90,.10)', 'rgba(230,140,60,.10)', 'rgba(140,180,255,.13)'];
 const SEASON_COL = ['#8d8', '#fd6', '#e96', '#9cf'];
-const TRAIT_INFO = { speed: ['Max speed', 'px/tick', 1], vision: ['Vision', 'px', 0], size: ['Size', 'px radius', 1], learn: ['Learning rate', 'trait', 3], teach: ['Teach fraction', 'trait', 2] };
+const TRAIT_INFO = { speed: ['Max speed', 'px/tick', 1], vision: ['Vision', 'px', 0], size: ['Size', 'px radius', 1], };
 const MET = {
   chase:  ['Food chasing', 'Hungry bots head toward grass they see. 0 = random, 1 = straight at it', '#ff6b6b', 2],
   follow: ['Following', 'Heading matches the nearest bot. 0 = random, 1 = always same way', '#ffd166', 2],
@@ -407,24 +407,17 @@ function statsView(){
       ['chase', 'follow', 'sprint', 'call', 'warn'].map(m => `<td>${f2(L.m ? L.m[m] : null)}</td>`).join('') + '</tr>').join('') || '<tr><td colspan="10">None</td></tr>');
   // ---- learning & heritage ----
   const Hr = s.her, K = Hr.kids, pct = (a, b) => b ? Math.round(100 * a / b) + '%' : '–', avgT = k => world.bots.length ? world.bots.reduce((a, b) => a + b.traits[k], 0) / world.bots.length : null;
-  const dmagNow = world.bots.length ? world.bots.reduce((a, b) => a + b.D.reduce((x, y) => x + Math.abs(y), 0) / b.D.length, 0) / world.bots.length / C.deltaUnit : null;
   const L2 = Hr.lgAll, Cc = Hr.careAll, M = Hr.lm, WL = Hr.winterLin;
   $('her-cards').innerHTML = [
-    card('Learned change now', f2(dmagNow, 3), 'avg size of learned weight changes (max 1)'),
-    card('Learning rate (trait)', f2(avgT('learn'), 3), 'start ' + BotSim.DEFAULT_TRAITS.learn + '; evolves'),
-    card('Teach fraction (trait)', f2(avgT('teach'), 2), 'share of learning passed to children; start ' + BotSim.DEFAULT_TRAITS.teach),
     card('Lifetime gain', L2.n ? f2((L2.e2 - L2.e1) / L2.n, 1) : '–', L2.n ? 'meals: ' + f2(L2.e1 / L2.n, 1) + ' in 1st 20 min → ' + f2(L2.e2 / L2.n, 1) + ' in 2nd (' + L2.n + ' adults)' : 'needs adults 40+ min old'),
     card('Newborn survival', pct(K.surv, K.surv + K.died), 'children reaching 15 min (' + (K.surv + K.died) + ' resolved)'),
-    card('Apprenticed vs not', pct(K.apS, K.apS + K.apD) + ' / ' + pct(K.orS, K.orS + K.orD), 'survival of children who stayed near a parent vs others'),
-    card('Taught vs untaught', pct(K.inS, K.inS + K.inD) + ' / ' + pct(K.niS, K.niS + K.niD), 'survival with vs without inherited learning'),
-    card('Time near parent', pct(Cc.near, Cc.ns), 'children 3-20 min old; imitation events ' + Hr.imitN),
+    card('Time near parent', pct(Cc.near, Cc.ns), 'children 3-20 min old'),
     card('Parents feeding children', Hr.feedChild, 'food dropped near own young child'),
     card('Landmarks now', (world.landmarks || []).length, M.placed + ' placed, ' + M.visits + ' revisits, ' + M.gone + ' faded'),
     card('Where landmarks go', M.placed ? f2(M.fert / M.placed, 2) : '–', 'avg fertility at placement; ' + pct(M.bank, M.placed) + ' on riverbanks (land: ' + Math.round(100 * BotSim.terrain(world).bankFrac) + '%)'),
     card('Winter survival of families', pct(WL.mS, WL.mN) + ' / ' + pct(WL.nS, WL.nN), 'with landmarks vs without (' + WL.mN + ' / ' + WL.nN + ' families)')
   ].join('');
-  if (!$('c-dmag')) $('her-charts').innerHTML = [['dmag', 'Learned change (avg |delta|)'], ['lm', 'Landmarks in the world']].map(a => `<div><div class="ct">${a[1]}</div><canvas class="chart" id="c-${a[0]}"></canvas></div>`).join('');
-  chart('c-dmag', st.series.dmag, '#ffcb6b', 0.05, dmagNow, 0);
+  if (!$('c-lm')) $('her-charts').innerHTML = [['lm', 'Landmarks in the world']].map(a => `<div><div class="ct">${a[1]}</div><canvas class="chart" id="c-${a[0]}"></canvas></div>`).join('');
   chart('c-lm', st.series.lm, '#c3e88d', 3, (world.landmarks || []).length, 0);
   // ---- caves ----
   const V = s.cv, CVs = BotSim.cavesOf(BotSim.terrain(world)), occN = BotSim.caveOcc(world);

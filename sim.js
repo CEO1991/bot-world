@@ -44,7 +44,7 @@
     resproutStrong: false,     // re-sprouts use a big mutation of the hall-of-fame brain
     resproutRandom: 1,         // BASELINE: one re-sprouted founder gets a fresh random brain (stops stale hall-of-fame traps)
     // ---- lifetime learning & heritage (switches exist for control experiments) ----
-    learning: false,           // experiments branch: lifetime learning switched off
+    learning: false,           // v11 rules: lifetime learning switched off
     inherit: false,            // children receive teach-fraction of the parent's learned deltas
     apprentice: false,         // children sense their parent and imitate it while young
     landmarkSense: true,       // bots sense family landmarks
@@ -77,7 +77,7 @@
                 'signalSide', 'signalAhead', 'signal1', 'signal2', 'speed',
                 'markSide', 'markAhead', 'markNear', 'foreignMark', 'parentSide', 'parentAhead', 'parentNear', 'parentAlive',
                 'caveSide', 'caveAhead', 'caveNear', 'inCave', 'caveCrowd', 'bias'];
-  // Trimmed (experiments branch): kin, foreign-flag, carrying and the four parent senses are computed nowhere in the brain.
+  // Trimmed (v11 rules): kin, foreign-flag, carrying and the four parent senses are computed nowhere in the brain.
   // They were removed because teaching/apprenticeship are gone and measurement showed the rest barely changed any action.
   var REMOVED = { botKin: 1, foreignMark: 1, carrying: 1, parentSide: 1, parentAhead: 1, parentNear: 1, parentAlive: 1 };
   var INPUTS = ALL_INPUTS.filter(function (k) { return !REMOVED[k]; }), MAP = INPUTS.map(function (k) { return ALL_INPUTS.indexOf(k); });
