@@ -4,49 +4,88 @@
 <title>Bot World</title>
 <style>
   html,body{margin:0;background:#111;color:#dde;font:14px -apple-system,system-ui,sans-serif}
-  #wrap{max-width:900px;margin:0 auto;padding:10px calc(10px + env(safe-area-inset-right)) 20px calc(10px + env(safe-area-inset-left))}
-  h1{font-size:18px;margin:4px 0 8px}
-  canvas{display:block;width:100%;height:auto;aspect-ratio:800/500;background:#1e2a38;border:3px solid #8aa;border-radius:6px;box-sizing:border-box}
+  #wrap{max-width:900px;margin:0 auto;padding:10px calc(10px + env(safe-area-inset-right)) 24px calc(10px + env(safe-area-inset-left))}
+  header{display:flex;align-items:center;justify-content:space-between;margin:4px 0 8px}
+  h1{font-size:18px;margin:0}
+  button{background:#2a3a4c;color:#fff;border:1px solid #8aa;border-radius:16px;padding:7px 14px;font:inherit;font-weight:600}
+  canvas#w{display:block;width:100%;height:auto;aspect-ratio:800/500;background:#1e2a38;border:3px solid #8aa;border-radius:6px;box-sizing:border-box}
   #hud{display:flex;flex-wrap:wrap;gap:6px 16px;margin:8px 0}
-  #hud b{color:#fff}
+  b{color:#fff}
   .bot{display:flex;align-items:center;gap:8px;margin:4px 0}
-  .dot{width:14px;height:14px;border-radius:50%}
+  .dot{display:inline-block;width:12px;height:12px;border-radius:50%;vertical-align:middle;margin-right:4px}
   .bar{flex:1;max-width:260px;height:10px;background:#333;border-radius:5px;overflow:hidden}
-  .fill{height:100%}
-  #events{margin-top:8px;color:#99a;font-size:12px;line-height:1.5}
+  .fill{display:block;height:100%}
+  .events{color:#99a;font-size:12px;line-height:1.55}
+  .events .death{color:#f99}.events .extinction{color:#f66;font-weight:600}.events .resprout,.events .birth{color:#9d9}
   #status{color:#fc6}
+  #stats{display:none}
+  body.stats #stats{display:block} body.stats #world{display:none}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:6px}
+  .card{background:#1b2633;border-radius:8px;padding:7px 9px}
+  .card .k{font-size:11px;color:#9ab;text-transform:uppercase;letter-spacing:.03em}
+  .card .v{font-size:17px;font-weight:700;color:#fff;margin-top:2px}
+  .card .s{font-size:11px;color:#9ab}
+  h2{font-size:14px;margin:14px 0 6px;color:#cde}
+  .chart{width:100%;height:110px;display:block;background:#1b2633;border-radius:8px;margin-bottom:6px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  td,th{padding:3px 4px;text-align:right;border-bottom:1px solid #2a3540}
+  td:first-child,th:first-child{text-align:left}
+  th{color:#9ab;font-weight:600}
+  .tw{overflow-x:auto}
 </style></head>
 <body><div id="wrap">
-<h1>Bot World</h1>
-<canvas id="w" width="800" height="500"></canvas>
-<div id="hud"><span>World age: <b id="age">–</b></span><span>Bots alive: <b id="alive">–</b></span><span>Grass: <b id="grass">–</b></span><span id="status">Loading world…</span></div>
-<div id="bots"></div>
-<div id="events"></div>
+<header><h1>Bot World</h1><button id="toggle">📊 Stats</button></header>
+<div id="world">
+  <canvas id="w" width="800" height="500"></canvas>
+  <div id="hud"><span>World age: <b id="age">–</b></span><span>Era: <b id="era">–</b></span><span>Bots alive: <b id="alive">–</b></span><span>Grass: <b id="grass">–</b></span><span id="status">Loading world…</span></div>
+  <div id="bots"></div>
+  <div id="events" class="events"></div>
 </div>
-<script src="sim.js?v=2"></script>
+<div id="stats">
+  <div class="grid" id="cards"></div>
+  <h2>Bots alive</h2><canvas class="chart" id="c-alive"></canvas>
+  <h2>Grass in the world</h2><canvas class="chart" id="c-grass"></canvas>
+  <h2>Average bot energy</h2><canvas class="chart" id="c-energy"></canvas>
+  <h2>Living bots</h2><div class="tw"><table id="t-live"></table></div>
+  <h2>Recent lifespans</h2><div class="tw"><table id="t-dead"></table></div>
+  <h2>Event log</h2><div id="s-events" class="events"></div>
+</div>
+</div>
+<script src="stats.js?v=3"></script>
+<script src="sim.js?v=3"></script>
 <script>
 (function(){
-const C = BotSim.CONFIG, cv = document.getElementById('w'), g = cv.getContext('2d');
-const $ = id => document.getElementById(id);
-let world = null, lastHud = 0, lastSave = 0;
+const C = BotSim.CONFIG, ST = BotSim.Stats, cv = document.getElementById('w'), g = cv.getContext('2d');
+const $ = id => document.getElementById(id), fmt = BotSim.formatDuration;
+let world = null, lastHud = 0, lastStats = 0, lastSave = 0;
+const LS_KEY = 'botworld-v' + BotSim.VERSION;
 
-function sizeCanvas(){
-  const dpr = Math.min(window.devicePixelRatio || 1, 3), w = cv.clientWidth || 800;
-  const pw = Math.round(w * dpr), ph = Math.round(w * dpr * C.height / C.width);
-  if (cv.width !== pw) { cv.width = pw; cv.height = ph; }
+function fitCanvas(c, h){
+  const dpr = Math.min(window.devicePixelRatio || 1, 3), w = c.clientWidth || 800;
+  const pw = Math.round(w * dpr), ph = Math.round((h ? h(w) : c.clientHeight) * dpr);
+  if (c.width !== pw || c.height !== ph) { c.width = pw; c.height = ph; }
 }
-window.addEventListener('resize', sizeCanvas);
+const sizeWorld = () => fitCanvas(cv, w => w * C.height / C.width);
+window.addEventListener('resize', () => { sizeWorld(); lastStats = 0; });
+
+$('toggle').onclick = () => {
+  const on = document.body.classList.toggle('stats');
+  $('toggle').textContent = on ? '🌍 World' : '📊 Stats';
+  history.replaceState(null, '', on ? '#stats' : '#');
+  if (!on) sizeWorld(); lastStats = 0;
+};
+if (location.hash === '#stats') { document.body.classList.add('stats'); $('toggle').textContent = '🌍 World'; }
 
 async function fetchState(){
   const bust = '?t=' + Date.now();
   const urls = ['https://raw.githubusercontent.com/CEO1991/bot-world/main/state.json' + bust, 'state.json' + bust];
   let best = null;
   for (const u of urls) {
-    try { const r = await fetch(u, {cache:'no-store'}); if (r.ok) { const s = await r.json(); if (!best || s.tick > best.tick) best = s; } } catch(e) {}
+    try { const r = await fetch(u, {cache:'no-store'}); if (r.ok) { const s = await r.json();
+      if (s.version === BotSim.VERSION && (!best || s.tick > best.tick)) best = s; } } catch(e) {}
   }
-  // A copy this phone already computed further ahead is identical (deterministic), so reuse it.
-  try {
-    const local = JSON.parse(localStorage.getItem('botworld') || 'null');
+  try { // a copy this phone already computed further ahead is identical (deterministic), so reuse it
+    const local = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
     if (local && best && local.seed === best.seed && local.startTime === best.startTime && local.tick > best.tick) best = local;
   } catch(e) {}
   return best;
@@ -55,8 +94,7 @@ async function fetchState(){
 function catchUp(done){
   const target = BotSim.tickAt(world, Date.now()), start = world.tick;
   (function chunk(){
-    const left = BotSim.advanceTo(world, Date.now(), 50000);
-    if (left > 0) {
+    if (BotSim.advanceTo(world, Date.now(), 50000) > 0) {
       $('status').textContent = 'Catching up… ' + Math.round(100 * (world.tick - start) / Math.max(1, target - start)) + '%';
       setTimeout(chunk, 0);
     } else done();
@@ -65,7 +103,7 @@ function catchUp(done){
 
 function drawGrass(gr){
   const s = cv.width / C.width, r = C.grassRadius * 1.3 * s, x = gr.x * s, y = gr.y * s;
-  const age = Math.min(1, (world.tick - gr.born) / 30); // pop-in over 3 s
+  const age = Math.min(1, (world.tick - gr.born) / 30);
   g.fillStyle = '#2f7a2f'; g.beginPath(); g.arc(x, y + r*0.3, r * 0.9 * age, 0, 7); g.fill();
   g.strokeStyle = '#6fd36f'; g.lineWidth = Math.max(1, 1.6 * s); g.lineCap = 'round';
   for (let k = 0; k < 5; k++) {
@@ -73,46 +111,94 @@ function drawGrass(gr){
     g.beginPath(); g.moveTo(x + off, y + r * 0.6); g.lineTo(x + off + lean, y + r * 0.6 - r * (1.2 + (k % 2) * 0.5) * age); g.stroke();
   }
 }
-
 function drawBot(b, f){
   const s = cv.width / C.width, R = C.botRadius * s;
   const x = (b.px + (b.x - b.px) * f) * s, y = (b.py + (b.y - b.py) * f) * s;
   const dx = BotSim.DX[b.dir], dy = BotSim.DY[b.dir];
-  g.globalAlpha = 0.45 + 0.55 * Math.min(1, b.energy / (C.maxEnergy * 0.3)); // fades when hungry
-  g.fillStyle = b.color; g.beginPath(); g.arc(x, y, R, 0, 7); g.fill();
+  const grow = Math.min(1, 0.3 + (world.tick - b.born) / 30);
+  g.globalAlpha = 0.45 + 0.55 * Math.min(1, b.energy / (C.maxEnergy * 0.3));
+  g.fillStyle = b.color; g.beginPath(); g.arc(x, y, R * grow, 0, 7); g.fill();
   g.fillStyle = '#fff';
-  for (const o of [-1, 1]) { g.beginPath(); g.arc(x + dx*R*0.4 - dy*R*0.33*o, y + dy*R*0.4 + dx*R*0.33*o, R*0.22, 0, 7); g.fill(); }
+  for (const o of [-1, 1]) { g.beginPath(); g.arc(x + (dx*0.4 - dy*0.33*o)*R*grow, y + (dy*0.4 + dx*0.33*o)*R*grow, R*0.22*grow, 0, 7); g.fill(); }
   g.globalAlpha = 1;
 }
 
+const evHtml = list => list.slice().reverse().map(e => `<div class="${e.type}">[${fmt(e.tick * C.tickMs)}] ${e.text}</div>`).join('');
+
 function hud(){
-  $('age').textContent = BotSim.formatDuration(world.tick * C.tickMs);
+  $('age').textContent = fmt(world.tick * C.tickMs);
+  $('era').textContent = world.stats.era;
   $('alive').textContent = world.bots.length;
   $('grass').textContent = world.grass.length;
   $('bots').innerHTML = world.bots.map(b => {
-    const p = Math.max(0, b.energy / C.maxEnergy * 100);
-    const col = p > 50 ? '#5c5' : p > 20 ? '#fc3' : '#f44';
-    return `<div class="bot"><span class="dot" style="background:${b.color}"></span><span style="width:60px">${b.name}</span>` +
-           `<span class="bar"><span class="fill" style="display:block;width:${p.toFixed(1)}%;background:${col}"></span></span><span>${Math.ceil(p)}%</span></div>`;
-  }).join('') || '<div class="bot">No bots left. The grass keeps growing.</div>';
-  $('events').innerHTML = world.events.slice(-5).reverse().map(e =>
-    `<div>[${BotSim.formatDuration(e.tick * C.tickMs)}] ${e.text}</div>`).join('');
+    const p = Math.max(0, b.energy / C.maxEnergy * 100), col = p > 50 ? '#5c5' : p > 20 ? '#fc3' : '#f44';
+    return `<div class="bot"><span class="dot" style="background:${b.color}"></span><span style="width:76px">${b.name}</span>` +
+      `<span class="bar"><span class="fill" style="width:${p.toFixed(1)}%;background:${col}"></span></span><span>${Math.ceil(p)}%</span></div>`;
+  }).join('') || `<div class="bot">Extinct. New life sprouts in a few seconds…</div>`;
+  $('events').innerHTML = evHtml(world.stats.events.slice(-5));
+}
+
+function chart(id, ys, color, maxY, live){
+  const c = $(id); fitCanvas(c); const x = c.getContext('2d'), W = c.width, Hh = c.height, d = Math.min(window.devicePixelRatio || 1, 3);
+  const se = world.stats.series, ts = se.t.concat([world.tick]), vs = ys.concat([live]);
+  x.clearRect(0, 0, W, Hh);
+  const pl = 30 * d, pb = 16 * d, pt = 8 * d, pr = 8 * d, t0 = 0, t1 = Math.max(1, world.tick);
+  const mY = Math.max(maxY || 0, ...vs, 1);
+  const X = t => pl + (t - t0) / (t1 - t0) * (W - pl - pr), Y = v => Hh - pb - v / mY * (Hh - pb - pt);
+  x.font = (10 * d) + 'px system-ui'; x.fillStyle = '#9ab'; x.strokeStyle = '#2f3d4c'; x.lineWidth = d;
+  [0, mY / 2, mY].forEach(v => { x.beginPath(); x.moveTo(pl, Y(v)); x.lineTo(W - pr, Y(v)); x.stroke(); x.fillText(Math.round(v), 4 * d, Y(v) + 3 * d); });
+  x.fillText('0', pl, Hh - 3 * d); const lab = fmt(t1 * C.tickMs); x.fillText(lab, W - pr - x.measureText(lab).width, Hh - 3 * d);
+  // extinction markers
+  x.strokeStyle = 'rgba(255,90,90,.5)';
+  world.stats.events.filter(e => e.type === 'extinction').forEach(e => { x.beginPath(); x.moveTo(X(e.tick), pt); x.lineTo(X(e.tick), Hh - pb); x.stroke(); });
+  x.strokeStyle = color; x.lineWidth = 2 * d; x.lineJoin = 'round'; x.beginPath();
+  ts.forEach((t, i) => i ? x.lineTo(X(t), Y(vs[i])) : x.moveTo(X(t), Y(vs[i]))); x.stroke();
+}
+
+function statsView(){
+  const s = ST.summary(world), st = world.stats, E = s.energy, eff = E.gained + E.wasted ? E.gained / (E.gained + E.wasted) : 0;
+  const card = (k, v, sub) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div>${sub ? `<div class="s">${sub}</div>` : ''}</div>`;
+  const causes = Object.keys(s.deaths.byCause).map(c => c + ': ' + s.deaths.byCause[c]).join(', ');
+  $('cards').innerHTML = [
+    card('World age', fmt(s.ageMs)), card('Era', s.era, s.extinctions + ' extinction' + (s.extinctions === 1 ? '' : 's')),
+    card('Bots alive', s.alive, 'peak ' + s.peakAlive), card('Bots ever born', s.botsBorn),
+    card('Deaths', s.deaths.total, causes), card('Avg lifespan', s.deaths.total ? fmt(s.avgLifeMs) : '–', 'of dead bots'),
+    card('Longest life', s.maxLifeMs ? fmt(s.maxLifeMs) : '–', s.maxLifeName || ''),
+    card('Grass now', s.grassNow, 'max ' + C.maxGrass), card('Grass spawned', s.grassSpawned), card('Grass eaten', s.grassEaten),
+    card('Energy gained', Math.round(E.gained), Math.round(E.wasted) + ' wasted when full (' + Math.round(eff * 100) + '% used)'),
+    card('Energy spent', Math.round(E.spent), 'moving: ' + (C.drainPerTick * 10) + '/s per bot')
+  ].join('');
+  const avgE = world.bots.length ? world.bots.reduce((a, b) => a + b.energy, 0) / world.bots.length : 0;
+  chart('c-alive', st.series.alive, '#6cf', C.pairSize, world.bots.length);
+  chart('c-grass', st.series.grass, '#6fd36f', C.maxGrass, world.grass.length);
+  chart('c-energy', st.series.energy, '#fc6', C.maxEnergy, avgE);
+  $('t-live').innerHTML = '<tr><th>Bot</th><th>Age</th><th>Energy</th><th>Ate</th><th>Gained</th><th>Spent</th></tr>' +
+    (world.bots.map(b => `<tr><td><span class="dot" style="background:${b.color}"></span>${b.name}</td><td>${fmt((world.tick - b.born) * C.tickMs)}</td>` +
+      `<td>${Math.max(0, Math.round(b.energy))}</td><td>${b.eaten}</td><td>${Math.round(b.gained)}</td><td>${Math.round(b.spent)}</td></tr>`).join('') ||
+      '<tr><td colspan="6">None alive</td></tr>');
+  $('t-dead').innerHTML = '<tr><th>Bot</th><th>Era</th><th>Lived</th><th>Cause</th><th>Ate</th></tr>' +
+    (st.lifespans.slice(-15).reverse().map(l => `<tr><td>${l.name}</td><td>${l.era}</td><td>${fmt((l.died - l.born) * C.tickMs)}</td><td>${l.cause}</td><td>${l.eaten}</td></tr>`).join('') ||
+      '<tr><td colspan="5">No deaths yet</td></tr>');
+  $('s-events').innerHTML = evHtml(st.events.slice(-30));
 }
 
 function frame(){
   const now = Date.now();
   BotSim.advanceTo(world, now, 20000);
-  const f = Math.max(0, Math.min(1, (now - world.startTime) / C.tickMs - world.tick));
-  g.clearRect(0, 0, cv.width, cv.height);
-  world.grass.forEach(drawGrass);
-  world.bots.forEach(b => drawBot(b, f));
-  if (now - lastHud > 250) { hud(); lastHud = now; }
-  if (now - lastSave > 30000) { try { localStorage.setItem('botworld', BotSim.serialize(world)); } catch(e) {} lastSave = now; }
+  const inStats = document.body.classList.contains('stats');
+  if (!inStats) {
+    const f = Math.max(0, Math.min(1, (now - world.startTime) / C.tickMs - world.tick));
+    g.clearRect(0, 0, cv.width, cv.height);
+    world.grass.forEach(drawGrass);
+    world.bots.forEach(b => drawBot(b, f));
+    if (now - lastHud > 250) { hud(); lastHud = now; }
+  } else if (now - lastStats > 1000) { statsView(); lastStats = now; }
+  if (now - lastSave > 30000) { try { localStorage.setItem(LS_KEY, BotSim.serialize(world)); } catch(e) {} lastSave = now; }
   requestAnimationFrame(frame);
 }
 
 (async function start(){
-  sizeCanvas();
+  sizeWorld();
   const s = await fetchState();
   if (!s) { $('status').textContent = 'Could not load the world. Pull to refresh.'; return; }
   world = BotSim.deserialize(s);

@@ -7,10 +7,12 @@ const Sim = require('../sim.js');
 
 const file = path.join(__dirname, '..', 'state.json');
 const now = Date.now();
-let world;
-if (fs.existsSync(file)) {
-  world = Sim.deserialize(fs.readFileSync(file, 'utf8'));
-} else {
+let world = fs.existsSync(file) ? Sim.deserialize(fs.readFileSync(file, 'utf8')) : null;
+if (world && world.version !== Sim.VERSION) {
+  console.log('State is version', world.version, '- rules changed, starting a new world for version', Sim.VERSION);
+  world = null;
+}
+if (!world) {
   world = Sim.createWorld(crypto.randomBytes(4).readUInt32LE(0), now);
   console.log('Created new world, seed', world.seed);
 }
