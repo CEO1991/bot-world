@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bot World</title>
+<style>body{margin:0;background:#111;display:flex;justify-content:center;align-items:center;height:100vh}canvas{max-width:95vw;max-height:90vh;background:#1e2a38;border:4px solid #8aa}</style>
+</head><body><canvas id="w" width="800" height="500"></canvas>
+<script>
+const c=document.getElementById('w'),g=c.getContext('2d');
+const R=18;
+function mk(x,y,color){return{x,y,a:Math.random()*Math.PI*2,s:1.5,color,t:0};}
+const bots=[mk(200,250,'#6cf'),mk(600,250,'#f96')];
+function step(b){
+  if(--b.t<=0){b.a+= (Math.random()-0.5)*2; b.t=30+Math.random()*90;}
+  b.x+=Math.cos(b.a)*b.s; b.y+=Math.sin(b.a)*b.s;
+  if(b.x<R){b.x=R;b.a=Math.PI-b.a} if(b.x>c.width-R){b.x=c.width-R;b.a=Math.PI-b.a}
+  if(b.y<R){b.y=R;b.a=-b.a} if(b.y>c.height-R){b.y=c.height-R;b.a=-b.a}
+}
+function draw(b){
+  g.fillStyle=b.color;g.beginPath();g.arc(b.x,b.y,R,0,7);g.fill();
+  const ex=Math.cos(b.a)*7,ey=Math.sin(b.a)*7;
+  g.fillStyle='#fff';
+  for(const o of [-1,1]){const px=-Math.sin(b.a)*6*o,py=Math.cos(b.a)*6*o;
+    g.beginPath();g.arc(b.x+ex+px,b.y+ey+py,4,0,7);g.fill();}
+}
+(function loop(){g.clearRect(0,0,c.width,c.height);bots.forEach(b=>{step(b);draw(b)});requestAnimationFrame(loop)})();
+</script></body></html>
