@@ -41,6 +41,8 @@
     maxPop: 30, reproEnergy: 0.5, reproMinAge: 3000, reproCooldown: 9000, reproCost: 0.45, childEnergy: 0.5,
     mutRate: 0.08, mutSd: 0.25, bigMutChance: 0.04, bigMutSd: 0.6, wMax: 4,
     hallOfFame: 4, resproutDelayTicks: 50, pairSize: 2,
+    resproutStrong: false,     // re-sprouts use a big mutation of the hall-of-fame brain
+    resproutRandom: 0,         // this many re-sprouted founders get a fresh random brain instead
     // ---- lifetime learning & heritage (switches exist for control experiments) ----
     learning: false,           // experiments branch: lifetime learning switched off
     inherit: false,            // children receive teach-fraction of the parent's learned deltas
@@ -295,10 +297,10 @@
   function freshPair(w, why) {
     var hof = w.hof || [];
     for (var i = 0; i < CONFIG.pairSize; i++) {
-      var p = landSpot(w), src = hof.length ? hof[i % hof.length] : null, t = {}, k;
+      var p = landSpot(w), src = hof.length && i >= CONFIG.resproutRandom ? hof[i % hof.length] : null, t = {}, k;
       if (src) {
         makeBot(w, { name: src.name.split(' ')[0] + ' ' + (w.stats.era), hue: src.hue, traits: mutateTraits(w, src.traits),
-                     brain: mutateBrain(w, src.brain, false).brain, x: p[0], y: p[1], why: why + ', descended from hall-of-fame #' + src.id });
+                     brain: mutateBrain(w, src.brain, CONFIG.resproutStrong).brain, x: p[0], y: p[1], why: why + ', descended from hall-of-fame #' + src.id });
       } else {
         var q = PAIR[i % PAIR.length];
         for (k in DEFAULT_TRAITS) t[k] = DEFAULT_TRAITS[k];
