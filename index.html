@@ -29,10 +29,12 @@
   h2{font-size:14px;margin:14px 0 6px;color:#cde}
   .chart{width:100%;height:110px;display:block;background:#1b2633;border-radius:8px;margin-bottom:6px}
   table{width:100%;border-collapse:collapse;font-size:12px}
-  td,th{padding:3px 4px;text-align:right;border-bottom:1px solid #2a3540}
+  td,th{white-space:nowrap;padding:3px 4px;text-align:right;border-bottom:1px solid #2a3540}
   td:first-child,th:first-child{text-align:left}
   th{color:#9ab;font-weight:600}
   .tw{overflow-x:auto}
+  .stack{display:flex;height:16px;border-radius:8px;overflow:hidden;background:#333;margin:4px 0 6px}
+  .legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:12px;margin-bottom:6px}
 </style></head>
 <body><div id="wrap">
 <header><h1>Bot World</h1><button id="toggle">📊 Stats</button></header>
@@ -44,6 +46,7 @@
 </div>
 <div id="stats">
   <div class="grid" id="cards"></div>
+  <h2>Behaviour (share of all bot time)</h2><div id="beh"></div>
   <h2>Bots alive</h2><canvas class="chart" id="c-alive"></canvas>
   <h2>Grass in the world</h2><canvas class="chart" id="c-grass"></canvas>
   <h2>Average bot energy</h2><canvas class="chart" id="c-energy"></canvas>
@@ -52,14 +55,18 @@
   <h2>Event log</h2><div id="s-events" class="events"></div>
 </div>
 </div>
-<script src="stats.js?v=3.1"></script>
-<script src="sim.js?v=3.1"></script>
+<script src="stats.js?v=4"></script>
+<script src="sim.js?v=4"></script>
 <script>
 (function(){
 const C = BotSim.CONFIG, ST = BotSim.Stats, cv = document.getElementById('w'), g = cv.getContext('2d');
 const $ = id => document.getElementById(id), fmt = BotSim.formatDuration;
 let world = null, lastHud = 0, lastStats = 0, lastSave = 0;
 const LS_KEY = 'botworld-v' + BotSim.VERSION;
+const MODES = BotSim.MODES;
+const MODE = { seek: ['seeking food', '#ff6b6b'], recall: ['remembering', '#c792ea'], wander: ['wandering', '#a9b8c8'],
+               rest: ['resting', '#7fdbca'], near: ['seeking company', '#ffd166'], avoid: ['keeping distance', '#f78c6c'] };
+const SHORT = { seek: 'seek', recall: 'recall', wander: 'wander', rest: 'rest', near: 'near', avoid: 'avoid' };
 
 function fitCanvas(c, h){
   const dpr = Math.min(window.devicePixelRatio || 1, 3), w = c.clientWidth || 800;
@@ -115,13 +122,33 @@ function drawGrass(gr){
 function drawBot(b, f){
   const s = cv.width / C.width, R = C.botRadius * s;
   const x = (b.px + (b.x - b.px) * f) * s, y = (b.py + (b.y - b.py) * f) * s;
-  const dx = BotSim.DX[b.dir], dy = BotSim.DY[b.dir];
+  const dx = b.hx, dy = b.hy, col = MODE[b.mode] ? MODE[b.mode][1] : '#fff';
+  // faint vision circle, remembered food spot, and line to the current goal
+  g.strokeStyle = 'rgba(255,255,255,0.07)'; g.lineWidth = s; g.beginPath(); g.arc(x, y, C.visionRadius * s, 0, 7); g.stroke();
+  if (b.mem) {
+    const mx = b.mem.x * s, my = b.mem.y * s, k = 5 * s;
+    g.strokeStyle = b.color; g.globalAlpha = 0.6; g.lineWidth = 2 * s;
+    g.beginPath(); g.moveTo(mx - k, my - k); g.lineTo(mx + k, my + k); g.moveTo(mx + k, my - k); g.lineTo(mx - k, my + k); g.stroke();
+    g.globalAlpha = 1;
+  }
+  let goal = null;
+  if (b.mode === 'seek') goal = world.grass.find(q => q.id === b.target);
+  else if (b.mode === 'recall') goal = b.mem;
+  if (goal) { g.strokeStyle = col; g.globalAlpha = 0.5; g.setLineDash([4 * s, 4 * s]); g.lineWidth = 1.5 * s;
+    g.beginPath(); g.moveTo(x, y); g.lineTo(goal.x * s, goal.y * s); g.stroke(); g.setLineDash([]); g.globalAlpha = 1; }
   const grow = Math.min(1, 0.3 + (world.tick - b.born) / 30);
   g.globalAlpha = 0.45 + 0.55 * Math.min(1, b.energy / (C.maxEnergy * 0.3));
   g.fillStyle = b.color; g.beginPath(); g.arc(x, y, R * grow, 0, 7); g.fill();
   g.fillStyle = '#fff';
   for (const o of [-1, 1]) { g.beginPath(); g.arc(x + (dx*0.4 - dy*0.33*o)*R*grow, y + (dy*0.4 + dx*0.33*o)*R*grow, R*0.22*grow, 0, 7); g.fill(); }
+  if (b.mode === 'rest') { g.fillStyle = '#7fdbca'; g.font = 'bold ' + Math.round(11 * s) + 'px system-ui'; g.fillText('z', x + R * 0.8, y - R * 0.8); }
   g.globalAlpha = 1;
+  // behaviour label pill above the bot
+  const label = SHORT[b.mode] || b.mode, fs = Math.max(10, Math.round(13 * s));
+  g.font = '600 ' + fs + 'px system-ui'; const tw = g.measureText(label).width, ph = fs * 1.35, pw = tw + fs * 0.9;
+  let lx = Math.max(2, Math.min(cv.width - pw - 2, x - pw / 2)), ly = y - R - ph - 4 * s; if (ly < 2) ly = y + R + 4 * s;
+  g.fillStyle = 'rgba(10,16,24,0.75)'; g.beginPath(); g.rect(lx, ly, pw, ph); g.fill();
+  g.fillStyle = col; g.fillText(label, lx + fs * 0.45, ly + fs * 1.0);
 }
 
 const evHtml = list => list.slice().reverse().map(e => `<div class="${e.type}">[${fmt(e.tick * C.tickMs)}] ${e.text}</div>`).join('');
@@ -133,8 +160,10 @@ function hud(){
   $('grass').textContent = world.grass.length;
   $('bots').innerHTML = world.bots.map(b => {
     const p = Math.max(0, b.energy / C.maxEnergy * 100), col = p > 50 ? '#5c5' : p > 20 ? '#fc3' : '#f44';
+    const m = MODE[b.mode] || [b.mode, '#fff'];
     return `<div class="bot"><span class="dot" style="background:${b.color}"></span><span style="width:76px">${b.name}</span>` +
-      `<span class="bar"><span class="fill" style="width:${p.toFixed(1)}%;background:${col}"></span></span><span>${Math.ceil(p)}%</span></div>`;
+      `<span class="bar"><span class="fill" style="width:${p.toFixed(1)}%;background:${col}"></span></span><span style="width:36px">${Math.ceil(p)}%</span>` +
+      `<span style="color:${m[1]};font-weight:600">${m[0]}</span></div>`;
   }).join('') || `<div class="bot">Extinct. New life sprouts in a few seconds…</div>`;
   $('events').innerHTML = evHtml(world.stats.events.slice(-5));
 }
@@ -167,16 +196,28 @@ function statsView(){
     card('Longest life', s.maxLifeMs ? fmt(s.maxLifeMs) : '–', s.maxLifeName || ''),
     card('Grass now', s.grassNow, 'max ' + C.maxGrass), card('Grass spawned', s.grassSpawned), card('Grass eaten', s.grassEaten),
     card('Energy gained', Math.round(E.gained), Math.round(E.wasted) + ' wasted when full (' + Math.round(eff * 100) + '% used)'),
-    card('Energy spent', Math.round(E.spent), 'moving: ' + (C.drainPerTick * 10) + '/s per bot')
+    card('Energy spent', Math.round(E.spent), 'active ' + ((C.drainBase + C.drainPerSpeed * C.botSpeed) * 10).toFixed(2) + '/s, resting ' + ((C.drainBase + C.drainPerSpeed * C.restSpeed) * 10).toFixed(2) + '/s'),
+    card('Found by sight', s.food.sight, 'walked to grass it saw'), card('Found via memory', s.food.memory, s.memoryForgotten + ' trips found nothing'),
+    card('Found by bumping', s.food.bump, 'touched it by chance')
   ].join('');
+  const pct = (t, tot) => tot ? 100 * t / tot : 0;
+  const stack = t => { const tot = MODES.reduce((a, m) => a + (t[m] || 0), 0);
+    return `<div class="stack">${MODES.map(m => `<span title="${m}" style="width:${pct(t[m] || 0, tot).toFixed(2)}%;background:${MODE[m][1]}"></span>`).join('')}</div>`; };
+  const totB = MODES.reduce((a, m) => a + s.behavior[m], 0);
+  $('beh').innerHTML = stack(s.behavior) + '<div class="legend">' + MODES.map(m =>
+      `<span><span class="dot" style="background:${MODE[m][1]}"></span>${MODE[m][0]} ${pct(s.behavior[m], totB).toFixed(1)}%</span>`).join('') + '</div>' +
+    '<div class="tw"><table><tr><th>Bot</th>' + MODES.map(m => `<th style="color:${MODE[m][1]}">${SHORT[m]}</th>`).join('') + '</tr>' +
+    world.bots.concat(st.lifespans.slice(-6).reverse()).map(b => { const t = b.time || {}, tot = MODES.reduce((a, m) => a + (t[m] || 0), 0);
+      return `<tr><td>${b.name}${b.died ? ' †' : ''}</td>` + MODES.map(m => `<td>${pct(t[m] || 0, tot).toFixed(0)}%</td>`).join('') + '</tr>'; }).join('') +
+    '</table></div>';
   const avgE = world.bots.length ? world.bots.reduce((a, b) => a + b.energy, 0) / world.bots.length : 0;
   chart('c-alive', st.series.alive, '#6cf', C.pairSize, world.bots.length, C.pairSize);
   chart('c-grass', st.series.grass, '#6fd36f', C.maxGrass, world.grass.length, C.startGrass);
   chart('c-energy', st.series.energy, '#fc6', C.maxEnergy, avgE, C.maxEnergy);
-  $('t-live').innerHTML = '<tr><th>Bot</th><th>Age</th><th>Energy</th><th>Ate</th><th>Gained</th><th>Spent</th></tr>' +
-    (world.bots.map(b => `<tr><td><span class="dot" style="background:${b.color}"></span>${b.name}</td><td>${fmt((world.tick - b.born) * C.tickMs)}</td>` +
-      `<td>${Math.max(0, Math.round(b.energy))}</td><td>${b.eaten}</td><td>${Math.round(b.gained)}</td><td>${Math.round(b.spent)}</td></tr>`).join('') ||
-      '<tr><td colspan="6">None alive</td></tr>');
+  $('t-live').innerHTML = '<tr><th>Bot</th><th>Doing</th><th>Age</th><th>Energy</th><th>Ate</th><th>Sight/Mem/Bump</th><th>Gained</th><th>Spent</th></tr>' +
+    (world.bots.map(b => `<tr><td><span class="dot" style="background:${b.color}"></span>${b.name}</td><td style="color:${MODE[b.mode][1]}">${SHORT[b.mode]}</td><td>${fmt((world.tick - b.born) * C.tickMs)}</td>` +
+      `<td>${Math.max(0, Math.round(b.energy))}</td><td>${b.eaten}</td><td>${b.found.sight}/${b.found.memory}/${b.found.bump}</td><td>${Math.round(b.gained)}</td><td>${Math.round(b.spent)}</td></tr>`).join('') ||
+      '<tr><td colspan="8">None alive</td></tr>');
   $('t-dead').innerHTML = '<tr><th>Bot</th><th>Era</th><th>Lived</th><th>Cause</th><th>Ate</th></tr>' +
     (st.lifespans.slice(-15).reverse().map(l => `<tr><td>${l.name}</td><td>${l.era}</td><td>${fmt((l.died - l.born) * C.tickMs)}</td><td>${l.cause}</td><td>${l.eaten}</td></tr>`).join('') ||
       '<tr><td colspan="5">No deaths yet</td></tr>');

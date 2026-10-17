@@ -11,12 +11,21 @@
     width: 800, height: 500,
     tickMs: 100,             // 10 ticks per real second
     botRadius: 18,
-    botSpeed: 4,             // px per tick (40 px/s)
+    botSpeed: 4,             // px per tick (40 px/s) when active
+    restSpeed: 1.5,          // px per tick while resting
     maxEnergy: 200,
-    drainPerTick: 0.04,      // 0.4 energy/s -> 500 s (8m20s) from full to empty without food
+    drainBase: 0.01,         // energy per tick just for being alive
+    drainPerSpeed: 0.0075,   // extra energy per tick per px/tick of speed (active: 0.04/tick, resting: ~0.021/tick)
+    visionRadius: 150,       // px a bot can see grass
+    hungerThreshold: 0.6,    // below this fraction of max energy a bot seeks food
+    restThreshold: 0.85,     // above this fraction it rests (moves slowly)
+    plentyLevel: 0.8,        // grass >= this fraction of maxGrass = plentiful -> bots stay near each other
+    scarceLevel: 0.4,        // grass <= this fraction of maxGrass = scarce -> bots keep their distance
+    nearDist: 110, avoidDist: 230, // social distances (px)
+    socialPull: 0.12,        // how strongly heading bends toward/away from the other bot (soft)
     grassRadius: 9,
     grassEnergy: 25,
-    grassSpawnChance: 0.008,  // per tick -> ~1 clump every 12.5 s (while below maxGrass)
+    grassSpawnChance: 0.00205, // per tick -> ~1 clump every 49 s (while below maxGrass); tuned for a few extinctions per week
     maxGrass: 5,              // scarce food cap: makes even a lone bot able to starve
     startGrass: 5,
     resproutDelayTicks: 50,  // 5 s after extinction a new pair sprouts
@@ -41,14 +50,16 @@
   }
   function randInt(w, lo, hi) { return lo + Math.floor(rand(w) * (hi - lo + 1)); }
 
-  var VERSION = 3; // bump when rules/tuning change in a way that makes old saves incompatible
+  var VERSION = 4; // bump when rules/tuning change in a way that makes old saves incompatible
   var H = Stats.hooks;
   var PAIR = [{ name: 'Blue', color: '#6cf' }, { name: 'Orange', color: '#f96' }];
 
   function makeBot(w, spec, x, y, why) {
     var b = { id: w.nextId++, name: spec.name + (w.stats.era > 1 ? ' ' + w.stats.era : ''), color: spec.color,
-              x: x, y: y, px: x, py: y, dir: randInt(w, 0, DIRS - 1), turn: randInt(w, 30, 120),
-              energy: CONFIG.maxEnergy, born: w.tick };
+              x: x, y: y, px: x, py: y, hx: 0, hy: 0, turn: randInt(w, 30, 120),
+              energy: CONFIG.maxEnergy, born: w.tick, mode: 'rest', speed: CONFIG.restSpeed,
+              target: null, mem: null, viaMemory: false };
+    var d = randInt(w, 0, DIRS - 1); b.hx = DX[d]; b.hy = DY[d];
     w.bots.push(b); H.birth(w, b, why); return b;
   }
 
@@ -68,6 +79,65 @@
     return w;
   }
 
+  // ---- Behaviour: a small priority system, evaluated per bot every tick ----
+  // hungry: seek visible grass > recall remembered food spot > wander
+  // fed:    social (near when food is plentiful / avoid when scarce) > rest (when energy high) > wander
+  function unit(b, dx, dy) { var l = Math.sqrt(dx * dx + dy * dy); if (l > 1e-9) { b.hx = dx / l; b.hy = dy / l; } }
+  function steer(b, dx, dy, k) {   // bend heading softly toward (dx,dy)
+    var l = Math.sqrt(dx * dx + dy * dy); if (l < 1e-9) return;
+    unit(b, b.hx + k * dx / l, b.hy + k * dy / l);
+  }
+  function wanderTurn(w, b) {
+    if (--b.turn > 0) return;
+    var k = (randInt(w, -8, 8) + DIRS) % DIRS, c = DX[k], s = DY[k];
+    unit(b, b.hx * c - b.hy * s, b.hx * s + b.hy * c);
+    b.turn = randInt(w, 30, 120);
+  }
+  function foodMood(w) {
+    var f = w.grass.length / CONFIG.maxGrass;
+    return f >= CONFIG.plentyLevel ? 'plenty' : f <= CONFIG.scarceLevel ? 'scarce' : 'normal';
+  }
+  function nearestGrass(w, b, radius) {
+    var best = null, bd = radius * radius;
+    for (var j = 0; j < w.grass.length; j++) {
+      var g = w.grass[j], dx = g.x - b.x, dy = g.y - b.y, d = dx * dx + dy * dy;
+      if (d <= bd) { bd = d; best = g; }
+    }
+    return best;
+  }
+  function decide(w, b) {
+    var E = b.energy / CONFIG.maxEnergy, prev = b.mode, mode, speed = CONFIG.botSpeed;
+    wanderTurn(w, b); // keeps RNG use identical regardless of mode
+    if (E < CONFIG.hungerThreshold) {
+      var g = nearestGrass(w, b, CONFIG.visionRadius);
+      if (g) {
+        if (prev === 'recall') b.viaMemory = true;          // memory brought it close enough to see food
+        else if (prev !== 'seek') b.viaMemory = false;
+        mode = 'seek'; b.target = g.id; unit(b, g.x - b.x, g.y - b.y);
+      } else if (b.mem) {
+        var mx = b.mem.x - b.x, my = b.mem.y - b.y;
+        if (mx * mx + my * my < 20 * 20) { b.mem = null; mode = 'wander'; H.forget(w, b); } // nothing here any more
+        else { mode = 'recall'; unit(b, mx, my); }
+        b.target = null;
+      } else { mode = 'wander'; b.target = null; }
+    } else {
+      b.target = null; b.viaMemory = false;
+      var other = null, od = Infinity;
+      for (var i = 0; i < w.bots.length; i++) {
+        var o = w.bots[i]; if (o === b) continue;
+        var ddx = o.x - b.x, ddy = o.y - b.y, dd = ddx * ddx + ddy * ddy;
+        if (dd < od) { od = dd; other = o; }
+      }
+      var mood = foodMood(w), dist = Math.sqrt(od);
+      if (other && mood === 'plenty' && dist > CONFIG.nearDist) { mode = 'near'; steer(b, other.x - b.x, other.y - b.y, CONFIG.socialPull); }
+      else if (other && mood === 'scarce' && dist < CONFIG.avoidDist) { mode = 'avoid'; steer(b, b.x - other.x, b.y - other.y, CONFIG.socialPull); }
+      else if (E > CONFIG.restThreshold) { mode = 'rest'; speed = CONFIG.restSpeed; }
+      else mode = 'wander';
+    }
+    b.mode = mode; b.speed = speed;
+    H.behavior(w, b, prev, mode);
+  }
+
   // ---- Rules: each is fn(world). Run in order every tick. Add mutation/reproduction here later. ----
   var RULES = [
     function growGrass(w) {
@@ -81,23 +151,23 @@
       for (var i = 0; i < CONFIG.pairSize; i++)
         makeBot(w, PAIR[i % PAIR.length], R + rand(w) * (CONFIG.width - 2 * R), R + rand(w) * (CONFIG.height - 2 * R), 'new life after extinction');
     },
-    function wander(w) {
-      var R = CONFIG.botRadius, W = CONFIG.width, H = CONFIG.height;
+    function behave(w) { for (var i = 0; i < w.bots.length; i++) decide(w, w.bots[i]); },
+    function move(w) {
+      var R = CONFIG.botRadius, W = CONFIG.width, Hh = CONFIG.height;
       for (var i = 0; i < w.bots.length; i++) {
         var b = w.bots[i];
         b.px = b.x; b.py = b.y;
-        if (--b.turn <= 0) { b.dir = (b.dir + randInt(w, -8, 8) + DIRS) % DIRS; b.turn = randInt(w, 30, 120); }
-        b.x += DX[b.dir] * CONFIG.botSpeed; b.y += DY[b.dir] * CONFIG.botSpeed;
-        if (b.x < R) { b.x = R; b.dir = (DIRS / 2 - b.dir + DIRS) % DIRS; }
-        if (b.x > W - R) { b.x = W - R; b.dir = (DIRS / 2 - b.dir + DIRS) % DIRS; }
-        if (b.y < R) { b.y = R; b.dir = (DIRS - b.dir) % DIRS; }
-        if (b.y > H - R) { b.y = H - R; b.dir = (DIRS - b.dir) % DIRS; }
+        b.x += b.hx * b.speed; b.y += b.hy * b.speed;
+        if (b.x < R) { b.x = R; b.hx = -b.hx; }
+        if (b.x > W - R) { b.x = W - R; b.hx = -b.hx; }
+        if (b.y < R) { b.y = R; b.hy = -b.hy; }
+        if (b.y > Hh - R) { b.y = Hh - R; b.hy = -b.hy; }
       }
     },
     function drainEnergy(w) {
       for (var i = 0; i < w.bots.length; i++) {
-        var b = w.bots[i], d = Math.min(CONFIG.drainPerTick, b.energy);
-        b.energy -= CONFIG.drainPerTick; H.spend(w, b, d);
+        var b = w.bots[i], cost = CONFIG.drainBase + CONFIG.drainPerSpeed * b.speed, d = Math.min(cost, b.energy);
+        b.energy -= cost; H.spend(w, b, d);
       }
     },
     function eatGrass(w) {
@@ -109,7 +179,10 @@
           if (dx * dx + dy * dy < r2) {
             var before = b.energy;
             b.energy = Math.min(CONFIG.maxEnergy, b.energy + CONFIG.grassEnergy);
-            H.eat(w, b, b.energy - before, CONFIG.grassEnergy - (b.energy - before));
+            var how = b.target === g.id && b.mode === 'seek' ? (b.viaMemory ? 'memory' : 'sight') : 'bump';
+            H.eat(w, b, b.energy - before, CONFIG.grassEnergy - (b.energy - before), how);
+            b.mem = { x: g.x, y: g.y };      // remember where food was last found
+            b.target = null; b.viaMemory = false;
             w.grass.splice(j, 1);
           }
         }
@@ -153,5 +226,5 @@
   function deserialize(text) { var w = typeof text === 'string' ? JSON.parse(text) : text; w.config = CONFIG; return w; }
 
   return { VERSION: VERSION, CONFIG: CONFIG, RULES: RULES, createWorld: createWorld, step: step, advanceTo: advanceTo, tickAt: tickAt,
-           serialize: serialize, deserialize: deserialize, Stats: Stats, formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS };
+           serialize: serialize, deserialize: deserialize, Stats: Stats, foodMood: foodMood, formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS, MODES: ['seek', 'recall', 'wander', 'rest', 'near', 'avoid'] };
 });
