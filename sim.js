@@ -1,6 +1,6 @@
 /* Bot World simulation core. Shared by the browser (index.html) and Node (scripts/advance.js).
- * Deterministic: only + - * / sqrt and Math.imul are used in the step, so every JS engine
- * produces the same world from the same state. Add new rules as functions in RULES below. */
+ * Deterministic: only + - * / sqrt, Math.floor/min/max/imul and the seeded PRNG are used in the step,
+ * so every JS engine produces the same world from the same state. Rules are the functions in RULES. */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory(require('./stats.js'));
   else root.BotSim = factory(root.BotStats);
@@ -8,29 +8,50 @@
   'use strict';
 
   var CONFIG = {
-    width: 800, height: 500,
-    tickMs: 100,             // 10 ticks per real second
-    botRadius: 18,
-    botSpeed: 4,             // px per tick (40 px/s) when active
-    restSpeed: 1.5,          // px per tick while resting
-    maxEnergy: 200,
-    drainBase: 0.01,         // energy per tick just for being alive
-    drainPerSpeed: 0.0075,   // extra energy per tick per px/tick of speed (active: 0.04/tick, resting: ~0.021/tick)
-    visionRadius: 150,       // px a bot can see grass
-    hungerThreshold: 0.6,    // below this fraction of max energy a bot seeks food
-    restThreshold: 0.85,     // above this fraction it rests (moves slowly)
-    plentyLevel: 0.8,        // grass >= this fraction of maxGrass = plentiful -> bots stay near each other
-    scarceLevel: 0.4,        // grass <= this fraction of maxGrass = scarce -> bots keep their distance
-    nearDist: 110, avoidDist: 230, // social distances (px)
-    socialPull: 0.12,        // how strongly heading bends toward/away from the other bot (soft)
+    width: 1000, height: 625,
+    tickMs: 100,               // 10 ticks per real second
+    // energy model (per tick). sizeF = size / 14
+    baseMaxEnergy: 200,        // max energy = 200 * sizeF^2 (bigger bodies store more)
+    drainBase: 0.01,           // * sizeF^2           (living cost)
+    drainPerSpeed: 0.0075,     // * speed * sizeF     (moving cost)
+    drainPerVision: 0.00004,   // * vision            (seeing far costs energy: 150px -> 0.006)
+    restSpeedFactor: 0.4,      // resting bots move at 40% of their speed
     grassRadius: 9,
     grassEnergy: 25,
-    grassSpawnChance: 0.00205, // per tick -> ~1 clump every 49 s (while below maxGrass); tuned for a few extinctions per week
-    maxGrass: 5,              // scarce food cap: makes even a lone bot able to starve
-    startGrass: 5,
-    resproutDelayTicks: 50,  // 5 s after extinction a new pair sprouts
+    // seasons: cycle = spring, summer, autumn, winter, each seasonTicks long
+    seasonTicks: 72000,        // 2 simulated hours per season -> 8-hour year
+    seasons: [
+      { name: 'Spring', spawn: 0.02,  cap: 30 },
+      { name: 'Summer', spawn: 0.03,  cap: 40 },
+      { name: 'Autumn', spawn: 0.012, cap: 20 },
+      { name: 'Winter', spawn: 0.006, cap: 12 }
+    ],
+    strengthMin: 0.7, strengthMax: 1.3, // each year's seeded strength: good seasons x s, winter / s
+    startGrass: 15,
+    // behaviour
+    plentyLevel: 0.75, scarceLevel: 0.35, // grass / current cap
+    nearDist: 110, avoidDist: 200, socialPull: 0.12,
+    decideEvery: 3,            // a bot re-decides every 3 ticks (staggered) to keep catch-up fast
+    // reproduction
+    maxPop: 30,
+    reproEnergy: 0.85,         // needs >= 85% of max energy
+    reproMinAge: 6000,         // 10 min old
+    reproCooldown: 9000,       // 15 min between children
+    reproCost: 0.55,           // parent pays 55% of its max energy...
+    childEnergy: 0.4,          // ...child starts with 40% of its own max (the rest is lost)
+    resproutDelayTicks: 50,
     pairSize: 2
   };
+
+  var DEFAULT_TRAITS = { speed: 4, vision: 150, hunger: 0.6, rest: 0.85, size: 14 };
+  var TRAIT_RULES = { // mutation sigma and clamp range
+    speed:  { sd: 0.25, min: 1,    max: 8 },
+    vision: { sd: 10,   min: 40,   max: 320 },
+    hunger: { sd: 0.04, min: 0.2,  max: 0.9 },
+    rest:   { sd: 0.04, min: 0.3,  max: 1.0 },
+    size:   { sd: 0.8,  min: 8,    max: 24 }
+  };
+  var TRAITS = ['speed', 'vision', 'hunger', 'rest', 'size'];
 
   // Deterministic 64-direction table (own Taylor series; Math.sin/cos differ between engines).
   var DIRS = 64, DX = [], DY = [];
@@ -49,18 +70,51 @@
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   }
   function randInt(w, lo, hi) { return lo + Math.floor(rand(w) * (hi - lo + 1)); }
+  function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
 
-  var VERSION = 4; // bump when rules/tuning change in a way that makes old saves incompatible
+  var VERSION = 5; // bump when rules/tuning change in a way that makes old saves incompatible
   var H = Stats.hooks;
-  var PAIR = [{ name: 'Blue', color: '#6cf' }, { name: 'Orange', color: '#f96' }];
+  var PAIR = [{ name: 'Blue', hue: 195 }, { name: 'Orange', hue: 25 }];
 
-  function makeBot(w, spec, x, y, why) {
-    var b = { id: w.nextId++, name: spec.name + (w.stats.era > 1 ? ' ' + w.stats.era : ''), color: spec.color,
-              x: x, y: y, px: x, py: y, hx: 0, hy: 0, turn: randInt(w, 30, 120),
-              energy: CONFIG.maxEnergy, born: w.tick, mode: 'rest', speed: CONFIG.restSpeed,
+  // ---- body / energy model derived from traits ----
+  function sizeF(b) { return b.traits.size / 14; }
+  function maxEnergy(b) { var f = sizeF(b); return CONFIG.baseMaxEnergy * f * f; }
+  function radius(b) { return b.traits.size; }
+  function drain(b) {
+    var f = sizeF(b);
+    return CONFIG.drainBase * f * f + CONFIG.drainPerSpeed * b.speed * f + CONFIG.drainPerVision * b.traits.vision;
+  }
+
+  // ---- seasons ----
+  function seasonInfo(w, tick) {
+    var t = tick === undefined ? w.tick : tick, len = CONFIG.seasonTicks;
+    var idx = Math.floor(t / len) % 4, year = Math.floor(t / (4 * len));
+    var s = CONFIG.seasons[idx], k = w.yearStrength;
+    var m = idx === 3 ? 1 / k : k;
+    return { index: idx, name: s.name, year: year, strength: k, spawn: s.spawn * m,
+             cap: Math.max(1, Math.round(s.cap * m)), endsAt: (Math.floor(t / len) + 1) * len };
+  }
+
+  function makeBot(w, o) {
+    var b = { id: w.nextId++, name: o.name, gen: o.gen || 1, parent: o.parent || null, lineage: o.lineage || null,
+              hue: o.hue, traits: o.traits, x: o.x, y: o.y, px: o.x, py: o.y, hx: 0, hy: 0, turn: randInt(w, 30, 120),
+              energy: 0, born: w.tick, lastRepro: w.tick, kids: 0, mode: 'rest', speed: 0,
               target: null, mem: null, viaMemory: false };
+    if (!b.lineage) b.lineage = b.id;
+    b.speed = b.traits.speed * CONFIG.restSpeedFactor;
+    b.energy = o.energy === undefined ? maxEnergy(b) : o.energy;
     var d = randInt(w, 0, DIRS - 1); b.hx = DX[d]; b.hy = DY[d];
-    w.bots.push(b); H.birth(w, b, why); return b;
+    w.bots.push(b); H.birth(w, b, o.why);
+    return b;
+  }
+  function freshPair(w, why, randomPos) {
+    for (var i = 0; i < CONFIG.pairSize; i++) {
+      var p = PAIR[i % PAIR.length], t = {}, k;
+      for (k in DEFAULT_TRAITS) t[k] = DEFAULT_TRAITS[k];
+      var x = randomPos ? 30 + rand(w) * (CONFIG.width - 60) : (i === 0 ? 0.25 : 0.75) * CONFIG.width;
+      var y = randomPos ? 30 + rand(w) * (CONFIG.height - 60) : CONFIG.height / 2;
+      makeBot(w, { name: p.name + (w.stats.era > 1 ? ' ' + w.stats.era : ''), hue: p.hue, traits: t, x: x, y: y, why: why });
+    }
   }
 
   function spawnGrass(w) {
@@ -71,22 +125,18 @@
 
   function createWorld(seed, startTime) {
     var w = { version: VERSION, seed: seed >>> 0, rng: seed >>> 0, startTime: startTime, tick: 0, nextId: 1,
-              bots: [], grass: [], resproutAt: null, stats: Stats.create(), config: CONFIG };
+              bots: [], grass: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
     Stats.event(w, 'world', 'World created');
-    makeBot(w, PAIR[0], 200, 250, 'first pair');
-    makeBot(w, PAIR[1], 600, 250, 'first pair');
+    freshPair(w, 'first pair', false);
     for (var i = 0; i < CONFIG.startGrass; i++) spawnGrass(w);
     return w;
   }
 
-  // ---- Behaviour: a small priority system, evaluated per bot every tick ----
+  // ---- Behaviour: a small priority system per bot ----
   // hungry: seek visible grass > recall remembered food spot > wander
-  // fed:    social (near when food is plentiful / avoid when scarce) > rest (when energy high) > wander
+  // fed:    social with nearest neighbour (near when food plentiful / avoid when scarce) > rest (energy high) > wander
   function unit(b, dx, dy) { var l = Math.sqrt(dx * dx + dy * dy); if (l > 1e-9) { b.hx = dx / l; b.hy = dy / l; } }
-  function steer(b, dx, dy, k) {   // bend heading softly toward (dx,dy)
-    var l = Math.sqrt(dx * dx + dy * dy); if (l < 1e-9) return;
-    unit(b, b.hx + k * dx / l, b.hy + k * dy / l);
-  }
+  function steer(b, dx, dy, k) { var l = Math.sqrt(dx * dx + dy * dy); if (l < 1e-9) return; unit(b, b.hx + k * dx / l, b.hy + k * dy / l); }
   function wanderTurn(w, b) {
     if (--b.turn > 0) return;
     var k = (randInt(w, -8, 8) + DIRS) % DIRS, c = DX[k], s = DY[k];
@@ -94,7 +144,7 @@
     b.turn = randInt(w, 30, 120);
   }
   function foodMood(w) {
-    var f = w.grass.length / CONFIG.maxGrass;
+    var f = w.grass.length / seasonInfo(w).cap;
     return f >= CONFIG.plentyLevel ? 'plenty' : f <= CONFIG.scarceLevel ? 'scarce' : 'normal';
   }
   function nearestGrass(w, b, radius) {
@@ -105,57 +155,78 @@
     }
     return best;
   }
-  function decide(w, b) {
-    var E = b.energy / CONFIG.maxEnergy, prev = b.mode, mode, speed = CONFIG.botSpeed;
-    wanderTurn(w, b); // keeps RNG use identical regardless of mode
-    if (E < CONFIG.hungerThreshold) {
-      var g = nearestGrass(w, b, CONFIG.visionRadius);
+  function decide(w, b, mood) {
+    var E = b.energy / maxEnergy(b), prev = b.mode, mode, T = b.traits, speed = T.speed;
+    if (E < T.hunger) {
+      var g = nearestGrass(w, b, T.vision);
       if (g) {
-        if (prev === 'recall') b.viaMemory = true;          // memory brought it close enough to see food
-        else if (prev !== 'seek') b.viaMemory = false;
+        if (prev === 'recall') b.viaMemory = true; else if (prev !== 'seek') b.viaMemory = false;
         mode = 'seek'; b.target = g.id; unit(b, g.x - b.x, g.y - b.y);
       } else if (b.mem) {
         var mx = b.mem.x - b.x, my = b.mem.y - b.y;
-        if (mx * mx + my * my < 20 * 20) { b.mem = null; mode = 'wander'; H.forget(w, b); } // nothing here any more
+        if (mx * mx + my * my < 20 * 20) { b.mem = null; mode = 'wander'; H.forget(w, b); }
         else { mode = 'recall'; unit(b, mx, my); }
         b.target = null;
       } else { mode = 'wander'; b.target = null; }
     } else {
       b.target = null; b.viaMemory = false;
       var other = null, od = Infinity;
-      for (var i = 0; i < w.bots.length; i++) {
+      if (mood !== 'normal') for (var i = 0; i < w.bots.length; i++) {
         var o = w.bots[i]; if (o === b) continue;
         var ddx = o.x - b.x, ddy = o.y - b.y, dd = ddx * ddx + ddy * ddy;
         if (dd < od) { od = dd; other = o; }
       }
-      var mood = foodMood(w), dist = Math.sqrt(od);
-      if (other && mood === 'plenty' && dist > CONFIG.nearDist) { mode = 'near'; steer(b, other.x - b.x, other.y - b.y, CONFIG.socialPull); }
-      else if (other && mood === 'scarce' && dist < CONFIG.avoidDist) { mode = 'avoid'; steer(b, b.x - other.x, b.y - other.y, CONFIG.socialPull); }
-      else if (E > CONFIG.restThreshold) { mode = 'rest'; speed = CONFIG.restSpeed; }
+      var dist = Math.sqrt(od);
+      if (other && mood === 'plenty' && dist > CONFIG.nearDist) { mode = 'near'; steer(b, other.x - b.x, other.y - b.y, CONFIG.socialPull * CONFIG.decideEvery); }
+      else if (other && mood === 'scarce' && dist < CONFIG.avoidDist) { mode = 'avoid'; steer(b, b.x - other.x, b.y - other.y, CONFIG.socialPull * CONFIG.decideEvery); }
+      else if (E > T.rest) { mode = 'rest'; speed = T.speed * CONFIG.restSpeedFactor; }
       else mode = 'wander';
     }
     b.mode = mode; b.speed = speed;
-    H.behavior(w, b, prev, mode);
+    if (mode !== prev) H.modeChange(w, b, prev, mode);
   }
 
-  // ---- Rules: each is fn(world). Run in order every tick. Add mutation/reproduction here later. ----
+  function mutate(w, t) {
+    var c = {};
+    for (var i = 0; i < TRAITS.length; i++) {
+      var k = TRAITS[i], r = TRAIT_RULES[k];
+      var n = (rand(w) + rand(w) + rand(w) - 1.5) * 2;     // ~N(0,1)-ish, deterministic
+      c[k] = Math.round(clamp(t[k] + n * r.sd, r.min, r.max) * 1000) / 1000; // rounded: keeps saves small
+    }
+    if (c.rest < c.hunger + 0.05) c.rest = Math.min(1, c.hunger + 0.05);
+    return c;
+  }
+
+  // ---- Rules: each is fn(world), run in order every tick. ----
   var RULES = [
+    function seasons(w) {
+      var y = Math.floor(w.tick / (4 * CONFIG.seasonTicks));
+      if (y !== w.year) { w.year = y; w.yearStrength = CONFIG.strengthMin + rand(w) * (CONFIG.strengthMax - CONFIG.strengthMin); }
+      if (w.tick % CONFIG.seasonTicks === 0) H.season(w, seasonInfo(w));
+    },
     function growGrass(w) {
-      if (rand(w) < CONFIG.grassSpawnChance && w.grass.length < CONFIG.maxGrass) spawnGrass(w);
+      var s = seasonInfo(w);
+      if (rand(w) < s.spawn && w.grass.length < s.cap) spawnGrass(w);
     },
     function resprout(w) {
       if (w.bots.length > 0 || w.resproutAt === null || w.tick < w.resproutAt) return;
       w.resproutAt = null;
       H.newEra(w);
-      var R = CONFIG.botRadius;
-      for (var i = 0; i < CONFIG.pairSize; i++)
-        makeBot(w, PAIR[i % PAIR.length], R + rand(w) * (CONFIG.width - 2 * R), R + rand(w) * (CONFIG.height - 2 * R), 'new life after extinction');
+      freshPair(w, 'new life after extinction', true);
     },
-    function behave(w) { for (var i = 0; i < w.bots.length; i++) decide(w, w.bots[i]); },
-    function move(w) {
-      var R = CONFIG.botRadius, W = CONFIG.width, Hh = CONFIG.height;
+    function behave(w) {
+      var mood = foodMood(w), n = CONFIG.decideEvery;
       for (var i = 0; i < w.bots.length; i++) {
         var b = w.bots[i];
+        wanderTurn(w, b);                                   // keeps RNG use independent of mode
+        if ((w.tick + b.id) % n === 0) decide(w, b, mood);
+        H.behavior(w, b);
+      }
+    },
+    function move(w) {
+      var W = CONFIG.width, Hh = CONFIG.height;
+      for (var i = 0; i < w.bots.length; i++) {
+        var b = w.bots[i], R = radius(b);
         b.px = b.x; b.py = b.y;
         b.x += b.hx * b.speed; b.y += b.hy * b.speed;
         if (b.x < R) { b.x = R; b.hx = -b.hx; }
@@ -166,26 +237,39 @@
     },
     function drainEnergy(w) {
       for (var i = 0; i < w.bots.length; i++) {
-        var b = w.bots[i], cost = CONFIG.drainBase + CONFIG.drainPerSpeed * b.speed, d = Math.min(cost, b.energy);
+        var b = w.bots[i], cost = drain(b), d = Math.min(cost, b.energy);
         b.energy -= cost; H.spend(w, b, d);
       }
     },
     function eatGrass(w) {
-      var reach = CONFIG.botRadius + CONFIG.grassRadius, r2 = reach * reach;
       for (var i = 0; i < w.bots.length; i++) {
-        var b = w.bots[i];
+        var b = w.bots[i], reach = radius(b) + CONFIG.grassRadius, r2 = reach * reach, mx = maxEnergy(b);
         for (var j = w.grass.length - 1; j >= 0; j--) {
           var g = w.grass[j], dx = g.x - b.x, dy = g.y - b.y;
           if (dx * dx + dy * dy < r2) {
             var before = b.energy;
-            b.energy = Math.min(CONFIG.maxEnergy, b.energy + CONFIG.grassEnergy);
+            b.energy = Math.min(mx, b.energy + CONFIG.grassEnergy);
             var how = b.target === g.id && b.mode === 'seek' ? (b.viaMemory ? 'memory' : 'sight') : 'bump';
             H.eat(w, b, b.energy - before, CONFIG.grassEnergy - (b.energy - before), how);
-            b.mem = { x: g.x, y: g.y };      // remember where food was last found
+            b.mem = { x: g.x, y: g.y };
             b.target = null; b.viaMemory = false;
             w.grass.splice(j, 1);
           }
         }
+      }
+    },
+    function reproduce(w) {
+      var n = w.bots.length;
+      for (var i = 0; i < n && w.bots.length < CONFIG.maxPop; i++) {
+        var b = w.bots[i], mx = maxEnergy(b);
+        if (b.energy < CONFIG.reproEnergy * mx || w.tick - b.born < CONFIG.reproMinAge || w.tick - b.lastRepro < CONFIG.reproCooldown) continue;
+        b.energy -= CONFIG.reproCost * mx; b.lastRepro = w.tick; b.kids++;
+        var t = mutate(w, b.traits), hue = Math.round((b.hue + (rand(w) - 0.5) * 16 + 360) % 360);
+        var a = randInt(w, 0, DIRS - 1), off = radius(b) + t.size + 4;
+        var child = makeBot(w, { name: b.name, gen: b.gen + 1, parent: b.id, lineage: b.lineage, hue: hue, traits: t,
+                                 x: clamp(b.x + DX[a] * off, t.size, CONFIG.width - t.size), y: clamp(b.y + DY[a] * off, t.size, CONFIG.height - t.size),
+                                 why: 'child of #' + b.id, energy: 0 });
+        child.energy = CONFIG.childEnergy * maxEnergy(child);
       }
     },
     function starve(w) {
@@ -201,14 +285,11 @@
   ];
 
   function step(w) { w.tick++; for (var i = 0; i < RULES.length; i++) RULES[i](w); H.tick(w); }
-
   function tickAt(w, timeMs) { return Math.floor((timeMs - w.startTime) / CONFIG.tickMs); }
-
-  // Advance to the tick for real time `timeMs`. maxSteps (optional) limits work per call.
   function advanceTo(w, timeMs, maxSteps) {
     var target = tickAt(w, timeMs), n = 0;
     while (w.tick < target && (maxSteps === undefined || n < maxSteps)) { step(w); n++; }
-    return target - w.tick; // ticks still remaining
+    return target - w.tick;
   }
 
   function formatDuration(ms) {
@@ -219,12 +300,16 @@
   }
 
   function serialize(w) {
-    var copy = JSON.parse(JSON.stringify(w)); delete copy.config; Stats.compact(copy.stats);
+    var copy = JSON.parse(JSON.stringify(w)); delete copy.config; Stats.compact(copy);
     copy.savedAt = new Date(w.startTime + w.tick * CONFIG.tickMs).toISOString();
     return JSON.stringify(copy);
   }
   function deserialize(text) { var w = typeof text === 'string' ? JSON.parse(text) : text; w.config = CONFIG; return w; }
 
-  return { VERSION: VERSION, CONFIG: CONFIG, RULES: RULES, createWorld: createWorld, step: step, advanceTo: advanceTo, tickAt: tickAt,
-           serialize: serialize, deserialize: deserialize, Stats: Stats, foodMood: foodMood, formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS, MODES: ['seek', 'recall', 'wander', 'rest', 'near', 'avoid'] };
+  var api = { VERSION: VERSION, CONFIG: CONFIG, RULES: RULES, TRAITS: TRAITS, TRAIT_RULES: TRAIT_RULES, DEFAULT_TRAITS: DEFAULT_TRAITS,
+              createWorld: createWorld, step: step, advanceTo: advanceTo, tickAt: tickAt, serialize: serialize, deserialize: deserialize,
+              Stats: Stats, foodMood: foodMood, seasonInfo: seasonInfo, maxEnergy: maxEnergy, radius: radius, drain: drain,
+              formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS, MODES: Stats.MODES };
+  Stats.bind(api);
+  return api;
 });
