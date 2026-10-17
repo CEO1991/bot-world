@@ -26,7 +26,7 @@
   var LIMITS = { events: 80, lifespans: 30, seriesPoints: 240, sampleTicks: 600, seasonLog: 16, days: 30,
                  genMilestone: 10, patternGap: 216000, ema: 0.05, warmup: 3000, sustain: 30, decay: 0.98 };
   var SEASONS = ['Spring', 'Summer', 'Autumn', 'Winter'];
-  var TRAITS = ['speed', 'vision', 'size', 'learn', 'teach'];
+  var TRAITS = ['speed', 'vision', 'size'];
   var METRICS = ['chase', 'follow', 'herd', 'sprint', 'call', 'warn', 'huddle', 'cluster', 'settle', 'paths', 'cache', 'share', 'store', 'breed', 'learn', 'care', 'homing', 'shelter', 'cavestore', 'territory'];
   var PATTERNS = {
     chase:  { th: 0.5,  text: 'learned to chase food' },

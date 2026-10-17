@@ -42,9 +42,9 @@
     mutRate: 0.08, mutSd: 0.25, bigMutChance: 0.04, bigMutSd: 0.6, wMax: 4,
     hallOfFame: 4, resproutDelayTicks: 50, pairSize: 2,
     // ---- lifetime learning & heritage (switches exist for control experiments) ----
-    learning: true,            // reward-modulated plastic layer on the output weights
-    inherit: true,             // children receive teach-fraction of the parent's learned deltas
-    apprentice: true,          // children sense their parent and imitate it while young
+    learning: false,           // experiments branch: lifetime learning switched off
+    inherit: false,            // children receive teach-fraction of the parent's learned deltas
+    apprentice: false,         // children sense their parent and imitate it while young
     landmarkSense: true,       // bots sense family landmarks
     deltaUnit: 4000,           // learned deltas are ints: 4000 = 1.0 weight; bounded to +-1.0
     apprenticeTicks: 12000,    // childhood (imitation possible): first 20 sim minutes
@@ -64,17 +64,22 @@
     mossCap: 3                 // at most 3 moss patches lying in a cave
   };
 
-  var TRAITS = ['speed', 'vision', 'size', 'learn', 'teach'];
-  var DEFAULT_TRAITS = { speed: 4, vision: 150, size: 14, learn: 0.05, teach: 0.2 };
+  var TRAITS = ['speed', 'vision', 'size'];
+  var DEFAULT_TRAITS = { speed: 4, vision: 150, size: 14 };
   var TRAIT_RULES = { speed: { sd: 0.25, min: 1, max: 8 }, vision: { sd: 10, min: 40, max: 320 }, size: { sd: 0.8, min: 8, max: 24 },
                      learn: { sd: 0.01, min: 0, max: 0.3 }, teach: { sd: 0.03, min: 0, max: 0.5 } };
 
-  var INPUTS = ['energy', 'grassNear', 'grassSide', 'grassAhead', 'botNear', 'botSide', 'botAhead', 'botEnergy', 'botKin',
+  var ALL_INPUTS = ['energy', 'grassNear', 'grassSide', 'grassAhead', 'botNear', 'botSide', 'botAhead', 'botEnergy', 'botKin',
                 'crowd', 'seasonSin', 'seasonCos', 'abundance', 'age', 'memory', 'warmth',
                 'onWater', 'elevation', 'fertilityAhead', 'slopeAhead', 'carrying',
                 'signalSide', 'signalAhead', 'signal1', 'signal2', 'speed',
                 'markSide', 'markAhead', 'markNear', 'foreignMark', 'parentSide', 'parentAhead', 'parentNear', 'parentAlive',
                 'caveSide', 'caveAhead', 'caveNear', 'inCave', 'caveCrowd', 'bias'];
+  // Trimmed (experiments branch): kin, foreign-flag, carrying and the four parent senses are computed nowhere in the brain.
+  // They were removed because teaching/apprenticeship are gone and measurement showed the rest barely changed any action.
+  var REMOVED = { botKin: 1, foreignMark: 1, carrying: 1, parentSide: 1, parentAhead: 1, parentNear: 1, parentAlive: 1 };
+  var INPUTS = ALL_INPUTS.filter(function (k) { return !REMOVED[k]; }), MAP = INPUTS.map(function (k) { return ALL_INPUTS.indexOf(k); });
+  var FIN = new Float64Array(ALL_INPUTS.length);
   var OUTPUTS = ['turn', 'thrust', 'reproduce', 'memory', 'signal1', 'signal2', 'pickUp', 'drop', 'eatCarried', 'mark'];
   var NI = INPUTS.length, NH = 8, NO = OUTPUTS.length;
   var NW = NI * NH + (NH + 1) * NO, ND = (NH + 1) * NO;   // ND = size of the plastic (learned) layer
@@ -99,7 +104,7 @@
   function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
   function tanh(x) { if (x > 3) return 1; if (x < -3) return -1; var x2 = x * x; return x * (27 + x2) / (27 + 9 * x2); }
 
-  var VERSION = 10;
+  var VERSION = 11;
   var H = Stats.hooks;
   var PAIR = [{ name: 'Blue', hue: 195 }, { name: 'Orange', hue: 25 }];
 
@@ -230,7 +235,7 @@
 
   // ---------------- genomes ----------------
   // new random brains start with weak links from the cave senses (newest inputs), so evolution decides whether caves matter
-  var WEAK_IN = { 34: 1, 35: 1, 36: 1, 37: 1, 38: 1 };
+  var WEAK_IN = {}; ['caveSide', 'caveAhead', 'caveNear', 'inCave', 'caveCrowd'].forEach(function (k) { if (INPUTS.indexOf(k) >= 0) WEAK_IN[INPUTS.indexOf(k)] = 1; });
   function randomBrain(w) { var g = []; for (var i = 0; i < NW; i++) { var v = (rand(w) - 0.5) * 1000; if (i < NI * NH && WEAK_IN[i % NI]) v *= 0.1; g.push(Math.round(v)); } return g; }
   function fitBrain(w, g) {   // pads (small random weights) or trims a genome of another size, e.g. from an older layout
     if (g.length === NW) return g;
@@ -260,7 +265,7 @@
   function canonBot(o) {
     var t = o.traits;
     return { id: o.id, name: o.name, gen: o.gen, parent: o.parent, lineage: o.lineage, hue: o.hue,
-             traits: { speed: t.speed, vision: t.vision, size: t.size, learn: t.learn, teach: t.teach }, brain: o.brain,
+             traits: { speed: t.speed, vision: t.vision, size: t.size }, brain: o.brain,
              x: o.x, y: o.y, px: o.px === undefined ? o.x : o.px, py: o.py === undefined ? o.y : o.py, hx: o.hx, hy: o.hy, vx: o.vx, vy: o.vy,
              energy: o.energy, born: o.born, lastRepro: o.lastRepro, kids: o.kids, th: o.th, tu: o.tu, want: o.want, mem: o.mem, s1: o.s1, s2: o.s2,
              pick: o.pick, drop: o.drop, eatC: o.eatC, carry: o.carry, warm: o.warm, bx: o.bx, by: o.by, k0: o.k0 === undefined ? -1 : o.k0,
@@ -350,48 +355,49 @@
     }
     b.warm = Math.min(1, warmN * CONFIG.warmPerBot);
     var mx = maxEnergy(b), E = b.energy / mx, k0 = tileAt(T, bx, by), ahead = tileAt(T, bx + hx * 40, by + hy * 40);
-    IN[0] = E;
-    if (g) { var gl = Math.sqrt(gd) || 1, gx = (g.x - bx) / gl, gy = (g.y - by) / gl; IN[1] = 1 - gl / V; IN[2] = hx * gy - hy * gx; IN[3] = hx * gx + hy * gy; }
-    else { IN[1] = 0; IN[2] = 0; IN[3] = 0; }
+    FIN[0] = E;
+    if (g) { var gl = Math.sqrt(gd) || 1, gx = (g.x - bx) / gl, gy = (g.y - by) / gl; FIN[1] = 1 - gl / V; FIN[2] = hx * gy - hy * gx; FIN[3] = hx * gx + hy * gy; }
+    else { FIN[1] = 0; FIN[2] = 0; FIN[3] = 0; }
     if (o) { var ol = Math.sqrt(od) || 1, ux = (o.x - bx) / ol, uy = (o.y - by) / ol;
-      IN[4] = 1 - ol / V; IN[5] = hx * uy - hy * ux; IN[6] = hx * ux + hy * uy; IN[7] = o.energy / maxEnergy(o); IN[8] = o.lineage === b.lineage ? 1 : 0; }
-    else { IN[4] = 0; IN[5] = 0; IN[6] = 0; IN[7] = 0; IN[8] = 0; }
-    IN[9] = crowd / 5;
+      FIN[4] = 1 - ol / V; FIN[5] = hx * uy - hy * ux; FIN[6] = hx * ux + hy * uy; FIN[7] = o.energy / maxEnergy(o); FIN[8] = o.lineage === b.lineage ? 1 : 0; }
+    else { FIN[4] = 0; FIN[5] = 0; FIN[6] = 0; FIN[7] = 0; FIN[8] = 0; }
+    FIN[9] = crowd / 5;
     var ph = Math.floor((w.tick % (4 * CONFIG.seasonTicks)) * DIRS / (4 * CONFIG.seasonTicks));
-    IN[10] = DY[ph]; IN[11] = DX[ph];
-    IN[12] = w.natural / info.cap;
-    IN[13] = Math.min(1, (w.tick - b.born) / 72000);
-    IN[14] = b.mem;
-    var temp = b.sh ? 1 : temperature(w, T, b); IN[15] = Math.min(1, temp + (1 - temp) * b.warm);
-    IN[16] = T.water[k0]; IN[17] = T.elev[k0]; IN[18] = T.fert[ahead]; IN[19] = (T.elev[ahead] - T.elev[k0]) * 4;
-    IN[20] = b.carry.length / CONFIG.maxCarry;
+    FIN[10] = DY[ph]; FIN[11] = DX[ph];
+    FIN[12] = w.natural / info.cap;
+    FIN[13] = Math.min(1, (w.tick - b.born) / 72000);
+    FIN[14] = b.mem;
+    var temp = b.sh ? 1 : temperature(w, T, b); FIN[15] = Math.min(1, temp + (1 - temp) * b.warm);
+    FIN[16] = T.water[k0]; FIN[17] = T.elev[k0]; FIN[18] = T.fert[ahead]; FIN[19] = (T.elev[ahead] - T.elev[k0]) * 4;
+    FIN[20] = b.carry.length / CONFIG.maxCarry;
     if (sb) { var sl = Math.sqrt((sb.x - bx) * (sb.x - bx) + (sb.y - by) * (sb.y - by)) || 1, sx = (sb.x - bx) / sl, sy = (sb.y - by) / sl;
-      IN[21] = hx * sy - hy * sx; IN[22] = hx * sx + hy * sy; IN[23] = sb.s1; IN[24] = sb.s2; }
-    else { IN[21] = 0; IN[22] = 0; IN[23] = 0; IN[24] = 0; }
-    IN[25] = Math.sqrt(b.vx * b.vx + b.vy * b.vy) / Tr.speed;
+      FIN[21] = hx * sy - hy * sx; FIN[22] = hx * sx + hy * sy; FIN[23] = sb.s1; FIN[24] = sb.s2; }
+    else { FIN[21] = 0; FIN[22] = 0; FIN[23] = 0; FIN[24] = 0; }
+    FIN[25] = Math.sqrt(b.vx * b.vx + b.vy * b.vy) / Tr.speed;
     // family landmarks: nearest own-lineage marker (direction + closeness) and closeness of the nearest foreign one
     var LM = w.landmarks, own = null, ownD = Infinity, forD = Infinity, LR = CONFIG.landmarkRange;
     for (i = 0; i < LM.length; i++) { var L = LM[i], lx = L.x - bx, ly = L.y - by, ld = lx * lx + ly * ly;
       if (L.lin === b.lineage) { if (ld < ownD) { ownD = ld; own = L; } } else if (ld < forD) forD = ld; }
     if (own) ownD = Math.sqrt(ownD);
     if (CONFIG.landmarkSense && own && ownD < LR) { var ol2 = ownD || 1, mx2 = (own.x - bx) / ol2, my2 = (own.y - by) / ol2;
-      IN[26] = hx * my2 - hy * mx2; IN[27] = hx * mx2 + hy * my2; IN[28] = 1 - ownD / LR; }
-    else { IN[26] = 0; IN[27] = 0; IN[28] = 0; }
-    IN[29] = CONFIG.landmarkSense && forD < LR * LR ? 1 - Math.sqrt(forD) / LR : 0;
+      FIN[26] = hx * my2 - hy * mx2; FIN[27] = hx * mx2 + hy * my2; FIN[28] = 1 - ownD / LR; }
+    else { FIN[26] = 0; FIN[27] = 0; FIN[28] = 0; }
+    FIN[29] = CONFIG.landmarkSense && forD < LR * LR ? 1 - Math.sqrt(forD) / LR : 0;
     // parent (only while it is alive and within range)
     var parD = Infinity;
     if (par) { var pxd = par.x - bx, pyd = par.y - by; parD = Math.sqrt(pxd * pxd + pyd * pyd); }
     if (CONFIG.apprentice && par && parD < CONFIG.parentRange) { var pl = parD || 1, qx = (par.x - bx) / pl, qy = (par.y - by) / pl;
-      IN[30] = hx * qy - hy * qx; IN[31] = hx * qx + hy * qy; IN[32] = 1 - parD / CONFIG.parentRange; IN[33] = 1; }
-    else { IN[30] = 0; IN[31] = 0; IN[32] = 0; IN[33] = 0; }
+      FIN[30] = hx * qy - hy * qx; FIN[31] = hx * qx + hy * qy; FIN[32] = 1 - parD / CONFIG.parentRange; FIN[33] = 1; }
+    else { FIN[30] = 0; FIN[31] = 0; FIN[32] = 0; FIN[33] = 0; }
     // caves: nearest one (direction, closeness), inside flag, crowding of the nearest cave
     var CV = cavesOf(T), cb = -1, cd = Infinity, CR = CONFIG.caveRange;
     for (i = 0; i < CV.length; i++) { var cxd = CV[i].x - bx, cyd = CV[i].y - by, c2 = cxd * cxd + cyd * cyd; if (c2 < cd) { cd = c2; cb = i; } }
     if (CONFIG.caveSense && cb >= 0 && cd < CR * CR) { cd = Math.sqrt(cd); var cl = cd || 1, kx = (CV[cb].x - bx) / cl, ky = (CV[cb].y - by) / cl;
-      IN[34] = cd < 1 ? 0 : hx * ky - hy * kx; IN[35] = cd < 1 ? 0 : hx * kx + hy * ky; IN[36] = 1 - cd / CR; IN[38] = rt(w).occ[cb] / CONFIG.caveCapacity; }
-    else { IN[34] = 0; IN[35] = 0; IN[36] = 0; IN[38] = 0; }
-    IN[37] = b.cv >= 0 ? 1 : 0;
-    IN[39] = 1;
+      FIN[34] = cd < 1 ? 0 : hx * ky - hy * kx; FIN[35] = cd < 1 ? 0 : hx * kx + hy * ky; FIN[36] = 1 - cd / CR; FIN[38] = rt(w).occ[cb] / CONFIG.caveCapacity; }
+    else { FIN[34] = 0; FIN[35] = 0; FIN[36] = 0; FIN[38] = 0; }
+    FIN[37] = b.cv >= 0 ? 1 : 0;
+    FIN[39] = 1;
+    for (i = 0; i < NI; i++) IN[i] = FIN[MAP[i]];   // the brain sees only the active inputs
     var W = weights(b.brain), k = 0, s;
     var nz = 0; for (i = 0; i < NI; i++) if (IN[i] !== 0) NZ[nz++] = i;   // skip zero inputs (adding 0 changes nothing)
     for (j = 0; j < NH; j++) { s = 0; var base = j * NI; for (i = 0; i < nz; i++) s += IN[NZ[i]] * W[base + NZ[i]]; HID[j] = tanh(s); }
@@ -399,11 +405,11 @@
     HID[NH] = 1;
     var D = b.D, DU = 1 / CONFIG.deltaUnit, dk = 0;   // output layer = genes + learned deltas
     for (j = 0; j < NO; j++) { s = 0; for (i = 0; i <= NH; i++) s += HID[i] * (W[k++] + D[dk++] * DU); OUT[j] = tanh(s); }
-    learnStep(w, b, par, parD, young);
+    if (CONFIG.learning) learnStep(w, b, par, parD, young);
     b.tu = OUT[0]; b.th = OUT[1] > 0 ? OUT[1] : OUT[1] * 0.3; b.want = OUT[2]; b.mem = OUT[3]; b.s1 = OUT[4]; b.s2 = OUT[5];
     b.pick = OUT[6]; b.drop = OUT[7]; b.eatC = OUT[8];
     landmarkStep(w, b, own, ownD, T);
-    PERC.E = E; PERC.grassAhead = g ? IN[3] : null; PERC.other = o; PERC.temp = temp; PERC.bank = T.bank[k0]; PERC.tile = k0; PERC.warm = IN[15];
+    PERC.E = E; PERC.grassAhead = g ? FIN[3] : null; PERC.other = o; PERC.temp = temp; PERC.bank = T.bank[k0]; PERC.tile = k0; PERC.warm = FIN[15];
     PERC.par = par; PERC.parD = parD; PERC.young = young; PERC.age = age; PERC.adults = adults; PERC.adultsNear = adultsNear; PERC.ownD = own ? ownD : null;
     H.perceive(w, b, PERC);
   }
@@ -598,7 +604,6 @@
         var hue = Math.round((b.hue + gauss(w) * 6 + 360) % 360);
         var a = randInt(w, 0, DIRS - 1), off = radius(b) + t.size + 4;
         var inh = zeros(ND);
-        if (CONFIG.inherit && CONFIG.learning) for (var q = 0; q < ND; q++) inh[q] = Math.round(b.D[q] * b.traits.teach);   // teaching
         var child = makeBot(w, { name: b.name, gen: b.gen + 1, parent: b.id, lineage: b.lineage, hue: hue, traits: t, brain: m.brain, D: inh,
                                  x: clamp(b.x + DX[a] * off, t.size, CONFIG.width - t.size), y: clamp(b.y + DY[a] * off, t.size, CONFIG.height - t.size),
                                  why: 'child of #' + b.id, energy: 0 });
@@ -671,7 +676,7 @@
   function decodeBrain(str) { var g = []; for (var i = 0; i < str.length; i += 2) g.push(ALPHA.indexOf(str[i]) * 91 + ALPHA.indexOf(str[i + 1]) - 4000); return g; }
   function serialize(w) {
     var copy = JSON.parse(JSON.stringify(w)); delete copy.config; Stats.compact(copy);
-    copy.bots.forEach(function (b) { b.brain = encodeBrain(b.brain); b.D = encodeBrain(b.D); delete b.px; delete b.py; delete b.k0; });
+    copy.bots.forEach(function (b) { b.brain = encodeBrain(b.brain); delete b.D; delete b.ph; delete b.po; delete b.px; delete b.py; delete b.k0; });
     copy.hof.forEach(function (h) { h.brain = encodeBrain(h.brain); });
     copy.savedAt = new Date(timeOfTick(w, w.tick)).toISOString();
     return JSON.stringify(copy);
