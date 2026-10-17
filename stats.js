@@ -78,6 +78,7 @@
              lg: { sum: 0, n: 0 }, lgAll: { sum: 0, n: 0, e1: 0, e2: 0 }, care: { p: 0, b: 0, n: 0 }, careAll: { p: 0, b: 0, n: 0, near: 0, ns: 0 },
              lm: { placed: 0, fert: 0, bank: 0, visits: 0, gone: 0 }, hm: { near: 0, exp: 0 }, hmAll: { near: 0, exp: 0 },
              winterLin: { mS: 0, mN: 0, nS: 0, nN: 0 }, wsnap: null },
+      game: { spawned: 0, hunts: 0, hunters: 0, multiFam: 0, meat: 0, meatHunter: 0, meatOther: 0, escaped: 0, wouldHunt: 0, tSum: 0 },
       cv: { inT: [0, 0, 0, 0], botT: [0, 0, 0, 0], shT: 0, drops: [0, 0, 0, 0], meals: [0, 0, 0, 0], flags: 0, mixed: 0, solo: 0,
             wS: { cS: 0, cD: 0, nS: 0, nD: 0 }, mossGrown: [0, 0, 0, 0], mossEaten: [0, 0, 0, 0], wExt: 0, own: [{}, {}, {}, {}, {}], linT: {}, inS: [null, null, null, null], first: 0 },
       warmS: [null, null, null, null],                                // smoothed contact share (vs random placement) per season
@@ -176,6 +177,13 @@
     },
     landmarkVisit: function (w) { S(w).her.lm.visits++; },
     landmarkGone: function (w) { S(w).her.lm.gone++; },
+    hunt: function (w, g, ids) {   // 3+ bots brought a large animal down together
+      var s = S(w), G = s.game, lins = {}, nl = 0, names = [];
+      G.hunts++; G.hunters += ids.length;
+      for (var i = 0; i < w.bots.length; i++) { var b = w.bots[i]; if (ids.indexOf(b.id) < 0) continue; names.push(label(b)); if (!lins[b.lineage]) { lins[b.lineage] = 1; nl++; } }
+      if (nl >= 2) G.multiFam++;
+      if (G.hunts === 1 || G.hunts % 50 === 0) event(w, 'hunt', (G.hunts === 1 ? 'First joint hunt: ' : 'Joint hunt #' + G.hunts + ': ') + names.join(', ') + ' brought down a large animal');
+    },
     mossGrow: function (w) { S(w).cv.mossGrown[seasonIdx(w)]++; },
     rot: function (w) { S(w).foodx.rotted++; },
     perceive: function (w, b, p) {
@@ -387,7 +395,7 @@
       deaths: s.deaths, grassSpawned: s.grassSpawned, grassEaten: s.grassEaten, grassNow: w.natural, droppedNow: w.dropped, maxGen: s.maxGen,
       avgLifeMs: L.count ? L.totalTicks / L.count * tm : 0, maxLifeMs: L.maxTicks * tm, maxLifeName: L.maxName,
       energy: s.energy, peakAlive: s.peakAlive, bySeason: s.bySeason, oldestLiving: oldestLiving(w), oldestEver: s.oldestLineage,
-      lineagesAlive: Object.keys(s.lineages).length, her: s.her, cv: s.cv, ema: s.ema, patterns: s.patterns, daily: s.daily.map(dayValues), foodx: s.foodx
+      lineagesAlive: Object.keys(s.lineages).length, her: s.her, cv: s.cv, ema: s.ema, patterns: s.patterns, daily: s.daily.map(dayValues), foodx: s.foodx, game: s.game
     };
   }
   return { LIMITS: LIMITS, SEASONS: SEASONS, METRICS: METRICS, PATTERNS: PATTERNS, bind: bind, create: create, hooks: hooks, event: event,

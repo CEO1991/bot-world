@@ -63,7 +63,11 @@
     moss: true,                // control: false
     mossEnergy: 12,            // vs 25 for grass
     mossRate: [0, 0, 0.0008, 0.0016],   // chance per tick per cave (spring, summer, autumn, winter)
-    mossCap: 3                 // at most 3 moss patches lying in a cave
+    mossCap: 3,                // at most 3 moss patches lying in a cave
+    // ---- big game (v12): occasional large animals; 3+ bots touching one at the same time bring it down,
+    // and it falls apart into meat pieces (each worth a grass patch) that anyone can eat or carry ----
+    gameChance: 1 / 12000, gameMax: 2, gameRadius: 18, gameSpeed: 0.8, gameLife: 72000, gameHunters: 3, gameMeat: 6, gameReach: 8,
+    gameSense: true, gameKill: true   // controls: animals unseen / cannot be taken down (then only 'would-be hunts' are counted)
   };
 
   var TRAITS = ['speed', 'vision', 'size'];
@@ -76,7 +80,7 @@
                 'onWater', 'elevation', 'fertilityAhead', 'slopeAhead', 'carrying',
                 'signalSide', 'signalAhead', 'signal1', 'signal2', 'speed',
                 'markSide', 'markAhead', 'markNear', 'foreignMark', 'parentSide', 'parentAhead', 'parentNear', 'parentAlive',
-                'caveSide', 'caveAhead', 'caveNear', 'inCave', 'caveCrowd', 'bias'];
+                'caveSide', 'caveAhead', 'caveNear', 'inCave', 'caveCrowd', 'gameSide', 'gameAhead', 'gameNear', 'bias'];
   // Trimmed (v11 rules): kin, foreign-flag, carrying and the four parent senses are computed nowhere in the brain.
   // They were removed because teaching/apprenticeship are gone and measurement showed the rest barely changed any action.
   var REMOVED = { botKin: 1, foreignMark: 1, carrying: 1, parentSide: 1, parentAhead: 1, parentNear: 1, parentAlive: 1 };
@@ -106,7 +110,7 @@
   function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
   function tanh(x) { if (x > 3) return 1; if (x < -3) return -1; var x2 = x * x; return x * (27 + x2) / (27 + 9 * x2); }
 
-  var VERSION = 11;
+  var VERSION = 12;
   var H = Stats.hooks;
   var PAIR = [{ name: 'Blue', hue: 195 }, { name: 'Orange', hue: 25 }];
 
@@ -328,7 +332,7 @@
 
   function createWorld(seed, startTime) {
     var w = { version: VERSION, seed: seed >>> 0, rng: seed >>> 0, terrainSeed: (seed ^ 0x9E3779B9) >>> 0, startTime: startTime, clocks: [{ t0: startTime, tick0: 0, rate: CONFIG.clockRate }], jumpTicks: 0, tick: 0, nextId: 1,
-              bots: [], grass: [], landmarks: [], natural: 0, dropped: 0, mossN: 0, hof: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
+              bots: [], grass: [], game: [], landmarks: [], natural: 0, dropped: 0, mossN: 0, hof: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
     Stats.event(w, 'world', 'World created');
     for (var i = 0; i < CONFIG.startGrass; i++) spawnGrass(w);
     freshPair(w, 'first pair');
@@ -398,7 +402,12 @@
       FIN[34] = cd < 1 ? 0 : hx * ky - hy * kx; FIN[35] = cd < 1 ? 0 : hx * kx + hy * ky; FIN[36] = 1 - cd / CR; FIN[38] = rt(w).occ[cb] / CONFIG.caveCapacity; }
     else { FIN[34] = 0; FIN[35] = 0; FIN[36] = 0; FIN[38] = 0; }
     FIN[37] = b.cv >= 0 ? 1 : 0;
-    FIN[39] = 1;
+    // big game: nearest large animal in sight (direction + closeness)
+    var GM = w.game, ga = null, gad = vis2;
+    for (i = 0; i < GM.length; i++) { var ax2 = GM[i].x - bx, ay2 = GM[i].y - by, a2 = ax2 * ax2 + ay2 * ay2; if (a2 < gad) { gad = a2; ga = GM[i]; } }
+    if (ga && CONFIG.gameSense) { var gl2 = Math.sqrt(gad) || 1, gx2 = (ga.x - bx) / gl2, gy2 = (ga.y - by) / gl2; FIN[39] = hx * gy2 - hy * gx2; FIN[40] = hx * gx2 + hy * gy2; FIN[41] = 1 - gl2 / V; }
+    else { FIN[39] = 0; FIN[40] = 0; FIN[41] = 0; }
+    FIN[42] = 1;
     for (i = 0; i < NI; i++) IN[i] = FIN[MAP[i]];   // the brain sees only the active inputs
     var W = weights(b.brain), k = 0, s;
     var nz = 0; for (i = 0; i < NI; i++) if (IN[i] !== 0) NZ[nz++] = i;   // skip zero inputs (adding 0 changes nothing)
@@ -460,6 +469,7 @@
     var before = b.energy, mx = maxEnergy(b), en = item.moss ? CONFIG.mossEnergy : CONFIG.grassEnergy;
     b.energy = Math.min(mx, b.energy + en);
     b.rw += b.energy - before;
+    if (item.meat) { w.stats.game.meat++; if (item.hunters && item.hunters.indexOf(b.id) >= 0) w.stats.game.meatHunter++; else w.stats.game.meatOther++; }
     H.eat(w, b, b.energy - before, en - (b.energy - before), item, how);
   }
 
@@ -575,7 +585,7 @@
             var dx = f.x - b.x, dy = f.y - b.y; if (dx * dx + dy * dy >= r2) continue;
             if (f.drop && f.dropper === b.id && w.tick - f.dropTick < CONFIG.ownDropGrace) continue;
             if (b.pick > 0.5 && b.carry.length < CONFIG.maxCarry) {
-              removeFood(w, f); b.carry.push({ id: f.id, born: f.born, picked: w.tick, dropper: f.dropper || null, dropLin: f.dropLin || null, dropTick: f.dropTick || null, corpse: f.corpse || 0, cave: f.cave || 0, moss: f.moss || 0 });
+              removeFood(w, f); b.carry.push({ id: f.id, born: f.born, picked: w.tick, dropper: f.dropper || null, dropLin: f.dropLin || null, dropTick: f.dropTick || null, corpse: f.corpse || 0, cave: f.cave || 0, moss: f.moss || 0, meat: f.meat || 0, hunters: f.hunters || null });
               H.pickup(w, b, f);
             } else if (b.energy < mx - 1) { removeFood(w, f); eatItem(w, b, f, f.drop ? 'ground-drop' : 'ground'); }
           }
@@ -588,9 +598,31 @@
           var fx = clamp(b.x - b.hx * (radius(b) + gr + 2), gr, CONFIG.width - gr), fy = clamp(b.y - b.hy * (radius(b) + gr + 2), gr, CONFIG.height - gr);
           var inC = caveAt(cavesOf(rt(w).terrain), fx, fy);   // food left inside a cave keeps much longer
           var dropped = { id: c2.id, x: fx, y: fy, born: c2.born, drop: 1, dropper: b.id, dropLin: b.lineage, dropTick: w.tick,
-                          rotAt: w.tick + CONFIG.dropDecayTicks * (inC >= 0 ? CONFIG.caveDecayMul : 1), picked: c2.picked, cave: inC >= 0 ? inC + 1 : 0, moss: c2.moss || 0 };
+                          rotAt: w.tick + CONFIG.dropDecayTicks * (inC >= 0 ? CONFIG.caveDecayMul : 1), picked: c2.picked, cave: inC >= 0 ? inC + 1 : 0, moss: c2.moss || 0, meat: c2.meat || 0, hunters: c2.hunters || null };
           addFood(w, dropped); H.dropped(w, b, dropped);
         }
+      }
+    },
+    function bigGame(w) {
+      var GM = w.game, C = CONFIG, i, j;
+      if (GM.length < C.gameMax && rand(w) < C.gameChance) { var p = landSpot(w), d = randInt(w, 0, DIRS - 1); GM.push({ id: w.nextId++, x: p[0], y: p[1], hx: DX[d], hy: DY[d], born: w.tick }); w.stats.game.spawned++; }
+      for (i = GM.length - 1; i >= 0; i--) {
+        var g = GM[i];
+        if (w.tick - g.born > C.gameLife) { GM.splice(i, 1); w.stats.game.escaped++; continue; }
+        if ((w.tick - g.born) % 100 === 0) { var d2 = randInt(w, 0, DIRS - 1); g.hx = DX[d2]; g.hy = DY[d2]; }
+        g.x += g.hx * C.gameSpeed; g.y += g.hy * C.gameSpeed;
+        if (g.x < C.gameRadius || g.x > C.width - C.gameRadius) { g.hx = -g.hx; g.x = clamp(g.x, C.gameRadius, C.width - C.gameRadius); }
+        if (g.y < C.gameRadius || g.y > C.height - C.gameRadius) { g.hy = -g.hy; g.y = clamp(g.y, C.gameRadius, C.height - C.gameRadius); }
+        if ((w.tick + g.id) % C.thinkEvery !== 0) continue;
+        var near = [];
+        for (j = 0; j < w.bots.length; j++) { var b = w.bots[j], R = C.gameRadius + radius(b) + C.gameReach, dx = b.x - g.x, dy = b.y - g.y; if (dx * dx + dy * dy < R * R) near.push(b.id); }
+        if (near.length < C.gameHunters) continue;
+        if (!C.gameKill) { if (!g.hit) { g.hit = 1; w.stats.game.wouldHunt++; w.stats.game.tSum += w.tick - g.born; } continue; }
+        w.stats.game.tSum += w.tick - g.born;
+        GM.splice(i, 1); H.hunt(w, g, near);
+        for (j = 0; j < C.gameMeat; j++) { var a = Math.floor(j * DIRS / C.gameMeat), gr = C.grassRadius;
+          addFood(w, { id: w.nextId++, x: clamp(g.x + DX[a] * 22, gr, C.width - gr), y: clamp(g.y + DY[a] * 22, gr, C.height - gr), born: w.tick, drop: 1, dropper: 0, dropTick: w.tick,
+                       rotAt: w.tick + C.dropDecayTicks, meat: 1, hunters: near.slice() }); }
       }
     },
     function reproduce(w) {
