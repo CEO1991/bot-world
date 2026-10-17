@@ -194,7 +194,7 @@
     },
     tick: function (w, T) {
       var s = S(w), n = w.bots.length;
-      s.bySeason[seasonName(w)].ticks++; s.winBotTicks += n;
+      s.bySeason[SEASONS[Math.floor(w.tick / w.config.seasonTicks) % 4]].ticks++; s.winBotTicks += n;
       if (w.tick % LIMITS.sampleTicks !== 0) return;
       // ---------- one sample per simulated minute ----------
       var v = accValues(s.win), herd = null, e = 0, sums = zero(TRAITS), div = null, i, j, si = seasonIdx(w), k = LIMITS.ema;

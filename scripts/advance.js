@@ -19,6 +19,12 @@ if (!world) {
 const before = world.tick;
 const t0 = Date.now();
 Sim.advanceTo(world, now);
+if (Sim.clockRate(world) !== Sim.CONFIG.clockRate) {
+  // keep the existing world: ticks so far stay at the old rate, from here on the clock runs at the new rate
+  console.log('Clock rate', Sim.clockRate(world), '->', Sim.CONFIG.clockRate, 'at tick', world.tick);
+  Sim.setClockRate(world, Sim.CONFIG.clockRate);
+  Sim.advanceTo(world, now);
+}
 fs.writeFileSync(file, Sim.serialize(world) + '\n');
 console.log(`Advanced ${world.tick - before} ticks in ${Date.now() - t0} ms -> tick ${world.tick}, ` +
-  `age ${Sim.formatDuration(world.tick * Sim.CONFIG.tickMs)}, bots ${world.bots.length}, grass ${world.natural}, dropped food ${world.dropped}`);
+  `sim age ${Sim.formatDuration(world.tick * Sim.CONFIG.tickMs)} at ${Sim.clockRate(world)}x, bots ${world.bots.length}, grass ${world.natural}, dropped food ${world.dropped}`);

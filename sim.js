@@ -10,7 +10,8 @@
 
   var CONFIG = {
     width: 1000, height: 625, tile: 25,      // terrain grid 40 x 25 tiles
-    tickMs: 100,
+    tickMs: 100,               // one tick = 0.1 simulated seconds
+    clockRate: 10,             // simulated seconds per real second for the shared world (new rate changes are recorded in w.clocks)
     // energy (per tick); sizeF = size / 14
     baseMaxEnergy: 200, drainBase: 0.008, drainPerThrust: 0.003, drainPerVision: 0.00004,
     climbCost: 0.6,            // energy per unit of elevation climbed (x sizeF^2); downhill refunds half
@@ -35,7 +36,7 @@
     // signals
     signalRange: 250,
     // brain
-    thinkEvery: 10,            // each bot thinks every 1 s (staggered); forces apply every tick
+    thinkEvery: 14,            // each bot thinks every 1.4 sim seconds (staggered; 0.14 real s at 10x); must stay even; forces apply every tick
     // reproduction (brain's reproduce output must be > 0 too)
     maxPop: 30, reproEnergy: 0.5, reproMinAge: 3000, reproCooldown: 9000, reproCost: 0.45, childEnergy: 0.35,
     mutRate: 0.08, mutSd: 0.25, bigMutChance: 0.04, bigMutSd: 0.6, wMax: 4,
@@ -155,7 +156,7 @@
 
   // ---------------- food spatial grid (ground items) ----------------
   var CELL = 50, GW = Math.ceil(CONFIG.width / CELL), GH = Math.ceil(CONFIG.height / CELL);
-  var HEAD = new Int32Array(GW * GH), NEXT = new Int32Array(64);
+  var HEAD = new Int32Array(GW * GH), NEXT = new Int32Array(64), CI = new Int32Array(64), FWD_X = [0, 1, -1, 0, 1], FWD_Y = [0, 0, 1, 1, 1];
   function cellOf(x, y) { var cx = Math.floor(x / CELL), cy = Math.floor(y / CELL); if (cx < 0) cx = 0; if (cy < 0) cy = 0; if (cx >= GW) cx = GW - 1; if (cy >= GH) cy = GH - 1; return cy * GW + cx; }
   function foodGridBuild(w) { var g = []; for (var i = 0; i < GW * GH; i++) g.push([]); for (i = 0; i < w.grass.length; i++) g[cellOf(w.grass[i].x, w.grass[i].y)].push(w.grass[i]); return g; }
   function addFood(w, f) { w.grass.push(f); rt(w).food[cellOf(f.x, f.y)].push(f); if (f.drop) w.dropped++; else w.natural++; }
@@ -179,6 +180,13 @@
     var s = CONFIG.seasons[idx], k = w.yearStrength, m = idx === 3 ? 1 / k : k;
     return { index: idx, name: s.name, year: year, strength: k, spawn: s.spawn * m,
              cap: Math.max(1, Math.round(s.cap * m)), endsAt: (Math.floor(t / len) + 1) * len, temp: CONFIG.seasonTemp[idx] };
+  }
+
+  var SC = { w: null, key: -1, ys: 0, v: null };
+  function seasonCached(w) {   // seasonInfo only changes at season boundaries / new years: reuse it (read-only)
+    var key = Math.floor(w.tick / CONFIG.seasonTicks);
+    if (SC.w !== w || SC.key !== key || SC.ys !== w.yearStrength) { SC.w = w; SC.key = key; SC.ys = w.yearStrength; SC.v = seasonInfo(w); }
+    return SC.v;
   }
 
   // ---------------- genomes ----------------
@@ -207,11 +215,21 @@
     if (WCACHE) WCACHE.set(g, f); return f;
   }
 
+  // Every bot object gets the same fields in the same order (fresh, born or loaded), so JS engines keep one fast shape.
+  function canonBot(o) {
+    var t = o.traits;
+    return { id: o.id, name: o.name, gen: o.gen, parent: o.parent, lineage: o.lineage, hue: o.hue,
+             traits: { speed: t.speed, vision: t.vision, size: t.size }, brain: o.brain,
+             x: o.x, y: o.y, px: o.px === undefined ? o.x : o.px, py: o.py === undefined ? o.y : o.py, hx: o.hx, hy: o.hy, vx: o.vx, vy: o.vy,
+             energy: o.energy, born: o.born, lastRepro: o.lastRepro, kids: o.kids, th: o.th, tu: o.tu, want: o.want, mem: o.mem, s1: o.s1, s2: o.s2,
+             pick: o.pick, drop: o.drop, eatC: o.eatC, carry: o.carry, warm: o.warm, bx: o.bx, by: o.by, k0: o.k0 === undefined ? -1 : o.k0,
+             eaten: o.eaten || 0, gained: o.gained || 0, spent: o.spent || 0, era: o.era || 0, hr: o.hr || [0, 0, 0, 0, 0], shared: o.shared || 0, cached: o.cached || 0 };
+  }
   function makeBot(w, o) {
-    var b = { id: w.nextId++, name: o.name, gen: o.gen || 1, parent: o.parent || null, lineage: o.lineage || null,
+    var b = canonBot({ id: w.nextId++, name: o.name, gen: o.gen || 1, parent: o.parent || null, lineage: o.lineage || null,
               hue: o.hue, traits: o.traits, brain: o.brain, x: o.x, y: o.y, px: o.x, py: o.y, hx: 0, hy: 0, vx: 0, vy: 0,
               energy: 0, born: w.tick, lastRepro: w.tick, kids: 0, th: 0, tu: 0, want: 0, mem: 0, s1: 0, s2: 0,
-              pick: 0, drop: 0, eatC: 0, carry: [], warm: 0, bx: o.x, by: o.y };
+              pick: 0, drop: 0, eatC: 0, carry: [], warm: 0, bx: o.x, by: o.y });
     if (!b.lineage) b.lineage = b.id;
     b.energy = o.energy === undefined ? maxEnergy(b) : o.energy;
     var d = randInt(w, 0, DIRS - 1); b.hx = DX[d]; b.hy = DY[d];
@@ -255,7 +273,7 @@
   }
 
   function createWorld(seed, startTime) {
-    var w = { version: VERSION, seed: seed >>> 0, rng: seed >>> 0, terrainSeed: (seed ^ 0x9E3779B9) >>> 0, startTime: startTime, tick: 0, nextId: 1,
+    var w = { version: VERSION, seed: seed >>> 0, rng: seed >>> 0, terrainSeed: (seed ^ 0x9E3779B9) >>> 0, startTime: startTime, clocks: [{ t0: startTime, tick0: 0, rate: CONFIG.clockRate }], tick: 0, nextId: 1,
               bots: [], grass: [], natural: 0, dropped: 0, hof: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
     Stats.event(w, 'world', 'World created');
     for (var i = 0; i < CONFIG.startGrass; i++) spawnGrass(w);
@@ -264,6 +282,7 @@
   }
 
   // ---------------- brain: sense -> think ----------------
+  var NZ = new Int32Array(NI), PERC = { E: 0, grassAhead: null, other: null, temp: 0, bank: 0, tile: 0, warm: 0 };
   var IN = new Float64Array(NI), HID = new Float64Array(NH + 1), OUT = new Float64Array(NO);
   function think(w, b, info, T) {
     var Tr = b.traits, V = Tr.vision, vis2 = V * V, hx = b.hx, hy = b.hy, bx = b.x, by = b.y, i, j;
@@ -276,8 +295,8 @@
       var ex = p.x - bx; if (ex > SR + V || ex < -SR - V) continue;
       var ey = p.y - by, e = ex * ex + ey * ey;
       if (e <= vis2) { crowd++; if (e < od) { od = e; o = p; } }
-      var wr = CONFIG.warmRadius + R + radius(p); if (e < wr * wr) warmN++;
-      if (e < SR * SR) { var strength = (Math.abs(p.s1) + Math.abs(p.s2)) * (1 - Math.sqrt(e) / SR); if (strength > sbest) { sbest = strength; sb = p; } }
+      var wr = CONFIG.warmRadius + R + p.traits.size; if (e < wr * wr) warmN++;
+      if (e < SR * SR) { var sa = Math.abs(p.s1) + Math.abs(p.s2); if (sa > sbest) { var strength = sa * (1 - Math.sqrt(e) / SR); if (strength > sbest) { sbest = strength; sb = p; } } }
     }
     b.warm = Math.min(1, warmN * CONFIG.warmPerBot);
     var mx = maxEnergy(b), E = b.energy / mx, k0 = tileAt(T, bx, by), ahead = tileAt(T, bx + hx * 40, by + hy * 40);
@@ -301,12 +320,15 @@
     else { IN[21] = 0; IN[22] = 0; IN[23] = 0; IN[24] = 0; }
     IN[25] = Math.sqrt(b.vx * b.vx + b.vy * b.vy) / Tr.speed; IN[26] = 1;
     var W = weights(b.brain), k = 0, s;
-    for (j = 0; j < NH; j++) { s = 0; for (i = 0; i < NI; i++) s += IN[i] * W[k++]; HID[j] = tanh(s); }
+    var nz = 0; for (i = 0; i < NI; i++) if (IN[i] !== 0) NZ[nz++] = i;   // skip zero inputs (adding 0 changes nothing)
+    for (j = 0; j < NH; j++) { s = 0; var base = j * NI; for (i = 0; i < nz; i++) s += IN[NZ[i]] * W[base + NZ[i]]; HID[j] = tanh(s); }
+    k = NH * NI;
     HID[NH] = 1;
     for (j = 0; j < NO; j++) { s = 0; for (i = 0; i <= NH; i++) s += HID[i] * W[k++]; OUT[j] = tanh(s); }
     b.tu = OUT[0]; b.th = OUT[1] > 0 ? OUT[1] : OUT[1] * 0.3; b.want = OUT[2]; b.mem = OUT[3]; b.s1 = OUT[4]; b.s2 = OUT[5];
     b.pick = OUT[6]; b.drop = OUT[7]; b.eatC = OUT[8];
-    H.perceive(w, b, { E: E, grassAhead: g ? IN[3] : null, other: o, temp: temp, bank: T.bank[k0], tile: k0, warm: IN[15] });
+    PERC.E = E; PERC.grassAhead = g ? IN[3] : null; PERC.other = o; PERC.temp = temp; PERC.bank = T.bank[k0]; PERC.tile = k0; PERC.warm = IN[15];
+    H.perceive(w, b, PERC);
   }
 
   function eatItem(w, b, item, how) {
@@ -323,7 +345,7 @@
       if (w.tick % CONFIG.seasonTicks === 0) H.season(w, seasonInfo(w));
     },
     function growGrass(w) {
-      var s = seasonInfo(w);
+      var s = seasonCached(w);
       if (rand(w) < s.spawn && w.natural < s.cap) spawnGrass(w);
       if (w.tick % 600 === 0 && w.dropped > 0) {          // dropped food slowly rots
         for (var i = w.grass.length - 1; i >= 0; i--) { var f = w.grass[i]; if (f.drop && w.tick >= f.rotAt) { removeFood(w, f); H.rot(w, f); } }
@@ -334,40 +356,42 @@
       w.resproutAt = null; H.newEra(w); freshPair(w, 'new life after extinction');
     },
     function brains(w) {
-      var n = CONFIG.thinkEvery, info = seasonInfo(w), T = rt(w).terrain;
-      for (var i = 0; i < w.bots.length; i++) { var b = w.bots[i]; if ((w.tick + b.id) % n === 0) think(w, b, info, T); }
+      var n = CONFIG.thinkEvery, info = null, T = null;
+      for (var i = 0; i < w.bots.length; i++) { var b = w.bots[i]; if ((w.tick + b.id) % n === 0) { if (!info) { info = seasonCached(w); T = rt(w).terrain; } think(w, b, info, T); } }
     },
     function physics(w) {
       var T = rt(w).terrain, W = CONFIG.width, Hh = CONFIG.height, BS = w.bots, i, j;
+      var TP = CONFIG.turnPerTick, FR = CONFIG.friction, WFR = CONFIG.waterFriction, CS = CONFIG.carrySlow, WB = CONFIG.wallBounce, TL = CONFIG.tile, TW = T.TW, TH = T.TH, WAT = T.water;
       for (i = 0; i < BS.length; i++) {
-        var b = BS[i], R = radius(b), sp = b.traits.speed;
-        b.px = b.x; b.py = b.y;
+        var b = BS[i], R = b.traits.size, sp = b.traits.speed, x = b.x, y = b.y, hx = b.hx, hy = b.hy;
+        b.px = x; b.py = y;
         // turning force and thrust (inertia + friction)
-        var t = b.tu * CONFIG.turnPerTick, nx = b.hx - b.hy * t, ny = b.hy + b.hx * t, nl = Math.sqrt(nx * nx + ny * ny);
-        b.hx = nx / nl; b.hy = ny / nl;
-        var k0 = tileAt(T, b.x, b.y), fr = T.water[k0] ? CONFIG.waterFriction : CONFIG.friction;
-        var acc = sp * (1 - CONFIG.friction) * b.th * (1 - CONFIG.carrySlow * b.carry.length);
-        b.vx = (b.vx + b.hx * acc) * fr; b.vy = (b.vy + b.hy * acc) * fr;
-        b.x += b.vx; b.y += b.vy;
+        if (b.tu !== 0) { var t = b.tu * TP, nx = hx - hy * t, ny = hy + hx * t, nl = Math.sqrt(nx * nx + ny * ny); hx = nx / nl; hy = ny / nl; }
+        var tx = Math.floor(x / TL), ty = Math.floor(y / TL); if (tx >= TW) tx = TW - 1; if (ty >= TH) ty = TH - 1; if (tx < 0) tx = 0; if (ty < 0) ty = 0;
+        var k0 = ty * TW + tx, fr = WAT[k0] ? WFR : FR;
+        var acc = sp * (1 - FR) * b.th * (1 - CS * b.carry.length);
+        var vx = (b.vx + hx * acc) * fr, vy = (b.vy + hy * acc) * fr;
+        x += vx; y += vy;
         // walls: bounce the velocity and turn the body away (a bot pushing into a wall glances off it)
-        if (b.x < R) { b.x = R; b.vx = -b.vx * CONFIG.wallBounce; if (b.hx < 0) b.hx = -b.hx; }
-        if (b.x > W - R) { b.x = W - R; b.vx = -b.vx * CONFIG.wallBounce; if (b.hx > 0) b.hx = -b.hx; }
-        if (b.y < R) { b.y = R; b.vy = -b.vy * CONFIG.wallBounce; if (b.hy < 0) b.hy = -b.hy; }
-        if (b.y > Hh - R) { b.y = Hh - R; b.vy = -b.vy * CONFIG.wallBounce; if (b.hy > 0) b.hy = -b.hy; }
-        b.k0 = k0;
+        if (x < R) { x = R; vx = -vx * WB; if (hx < 0) hx = -hx; }
+        if (x > W - R) { x = W - R; vx = -vx * WB; if (hx > 0) hx = -hx; }
+        if (y < R) { y = R; vy = -vy * WB; if (hy < 0) hy = -hy; }
+        if (y > Hh - R) { y = Hh - R; vy = -vy * WB; if (hy > 0) hy = -hy; }
+        b.x = x; b.y = y; b.vx = vx; b.vy = vy; b.hx = hx; b.hy = hy; b.k0 = k0;
       }
-      // soft collisions between bots (spatial grid as linked lists in reusable typed arrays)
-      var n = BS.length; if (n < 2) return;
+      // soft collisions between bots (spatial grid as linked lists in reusable typed arrays); every 2nd tick is enough
+      var n = BS.length; if (n < 2 || (w.tick & 1)) return;
       if (NEXT.length < n) NEXT = new Int32Array(n * 2);
       HEAD.fill(-1);
-      for (i = 0; i < n; i++) { var c = cellOf(BS[i].x, BS[i].y); NEXT[i] = HEAD[c]; HEAD[c] = i; }
+      if (CI.length < n) CI = new Int32Array(n * 2);
+      for (i = 0; i < n; i++) { var c = cellOf(BS[i].x, BS[i].y); CI[i] = c; NEXT[i] = HEAD[c]; HEAD[c] = i; }
       for (i = 0; i < n; i++) {
-        var a = BS[i], cx = Math.floor(a.x / CELL), cy = Math.floor(a.y / CELL), ra = radius(a);
-        for (var oy = -1; oy <= 1; oy++) for (var ox = -1; ox <= 1; ox++) {
-          var gx = cx + ox, gy = cy + oy; if (gx < 0 || gy < 0 || gx >= GW || gy >= GH) continue;
+        var a = BS[i], cx = CI[i] % GW, cy = (CI[i] - cx) / GW, ra = a.traits.size;   // the cell it was filed under
+        for (var q = 0; q < 5; q++) {   // own cell (pairs once) + 4 forward neighbours: every nearby pair is seen exactly once
+          var gx = cx + FWD_X[q], gy = cy + FWD_Y[q]; if (gx < 0 || gy < 0 || gx >= GW || gy >= GH) continue;
           for (j = HEAD[gy * GW + gx]; j !== -1; j = NEXT[j]) {
-            if (j <= i) continue;
-            var o = BS[j], dx = o.x - a.x, dy = o.y - a.y, d2 = dx * dx + dy * dy, rr = ra + radius(o);
+            if (q === 0 && j <= i) continue;
+            var o = BS[j], dx = o.x - a.x, dy = o.y - a.y, d2 = dx * dx + dy * dy, rr = ra + o.traits.size;
             if (d2 >= rr * rr || d2 === 0) continue;
             var d = Math.sqrt(d2), ux = dx / d, uy = dy / d, push = (rr - d) * 0.5;
             a.x -= ux * push; a.y -= uy * push; o.x += ux * push; o.y += uy * push;
@@ -382,7 +406,7 @@
       for (var i = 0; i < w.bots.length; i++) {
         var b = w.bots[i], f = sizeF(b), f2 = f * f, k1 = tileAt(T, b.x, b.y);
         var cost = CONFIG.drainBase * f2 + CONFIG.drainPerThrust * Math.abs(b.th) * b.traits.speed * f + CONFIG.drainPerVision * b.traits.vision;
-        var dh = T.elev[k1] - T.elev[b.k0 === undefined ? k1 : b.k0];
+        var dh = T.elev[k1] - T.elev[b.k0 < 0 ? k1 : b.k0];
         var climb = dh > 0 ? CONFIG.climbCost * dh * f2 : CONFIG.climbCost * 0.5 * dh * f2;
         var c = cold + (T.water[k1] ? 0.15 : 0); if (c > 1.5) c = 1.5;
         var heat = CONFIG.coldCost * c * (1 - b.warm) * f2;
@@ -393,6 +417,7 @@
     function food(w) {   // touching food: pick it up (if the brain wants to and has room) or eat it (if not full)
       var FG = rt(w).food, BS = w.bots, gr = CONFIG.grassRadius;
       for (var i = 0; i < BS.length; i++) {
+        if ((w.tick + BS[i].id) & 1) continue;   // each bot handles touch/eat/drop every 2nd tick (think ticks included: thinkEvery is even)
         var b = BS[i], reach = radius(b) + gr, r2 = reach * reach, mx = maxEnergy(b);
         var x0 = Math.max(0, Math.floor((b.x - reach) / CELL)), x1 = Math.min(GW - 1, Math.floor((b.x + reach) / CELL));
         var y0 = Math.max(0, Math.floor((b.y - reach) / CELL)), y1 = Math.min(GH - 1, Math.floor((b.y + reach) / CELL));
@@ -455,7 +480,33 @@
   ];
 
   function step(w) { w.tick++; for (var i = 0; i < RULES.length; i++) RULES[i](w); H.tick(w, rt(w).terrain); }
-  function tickAt(w, timeMs) { return Math.floor((timeMs - w.startTime) / CONFIG.tickMs); }
+  // ---- world clock: real time -> tick. Rate changes are recorded as segments {t0 (real ms), tick0, rate};
+  // before the first segment the world ran at 1x from startTime. Only + - * / floor, so every engine agrees.
+  function clockSeg(w, timeMs) {
+    var c = w.clocks, seg = null;
+    if (c) for (var i = c.length - 1; i >= 0; i--) if (timeMs >= c[i].t0) { seg = c[i]; break; }
+    return seg || { t0: w.startTime, tick0: 0, rate: 1 };
+  }
+  function tickAtF(w, timeMs) { var s = clockSeg(w, timeMs); return s.tick0 + (timeMs - s.t0) * s.rate / CONFIG.tickMs; }
+  function tickAt(w, timeMs) { return Math.floor(tickAtF(w, timeMs)); }
+  function timeOfTick(w, tick) {   // real ms at which the shared world reaches this tick
+    var c = w.clocks, seg = null;
+    if (c) for (var i = c.length - 1; i >= 0; i--) if (tick >= c[i].tick0) { seg = c[i]; break; }
+    seg = seg || { t0: w.startTime, tick0: 0, rate: 1 };
+    return seg.t0 + (tick - seg.tick0) * CONFIG.tickMs / seg.rate;
+  }
+  function clockRate(w) { return w.clocks && w.clocks.length ? w.clocks[w.clocks.length - 1].rate : 1; }
+  function setClockRate(w, rate) {   // from the world's current tick on, run at `rate`; earlier ticks keep their old timing
+    var t0 = timeOfTick(w, w.tick);
+    if (!w.clocks) w.clocks = [];
+    w.clocks.push({ t0: t0, tick0: w.tick, rate: rate });
+    Stats.event(w, 'world', 'World clock now runs at ' + rate + 'x real time');
+  }
+  function advanceToTick(w, tick, maxSteps) {
+    var n = 0;
+    while (w.tick < tick && (maxSteps === undefined || n < maxSteps)) { step(w); n++; }
+    return tick - w.tick;
+  }
   function advanceTo(w, timeMs, maxSteps) {
     var target = tickAt(w, timeMs), n = 0;
     while (w.tick < target && (maxSteps === undefined || n < maxSteps)) { step(w); n++; }
@@ -474,20 +525,20 @@
     var copy = JSON.parse(JSON.stringify(w)); delete copy.config; Stats.compact(copy);
     copy.bots.forEach(function (b) { b.brain = encodeBrain(b.brain); delete b.px; delete b.py; delete b.k0; });
     copy.hof.forEach(function (h) { h.brain = encodeBrain(h.brain); });
-    copy.savedAt = new Date(w.startTime + w.tick * CONFIG.tickMs).toISOString();
+    copy.savedAt = new Date(timeOfTick(w, w.tick)).toISOString();
     return JSON.stringify(copy);
   }
   function deserialize(text) {
     var w = typeof text === 'string' ? JSON.parse(text) : text; w.config = CONFIG;
     if (w.version !== VERSION) return w;
-    w.bots.forEach(function (b) { if (typeof b.brain === 'string') b.brain = decodeBrain(b.brain); if (b.px === undefined) { b.px = b.x; b.py = b.y; } });
+    w.bots = w.bots.map(function (b) { if (typeof b.brain === 'string') b.brain = decodeBrain(b.brain); return canonBot(b); });
     w.hof.forEach(function (h) { if (typeof h.brain === 'string') h.brain = decodeBrain(h.brain); });
     return w;
   }
   function terrain(w) { return rt(w).terrain; }
 
   var api = { VERSION: VERSION, CONFIG: CONFIG, RULES: RULES, TRAITS: TRAITS, TRAIT_RULES: TRAIT_RULES, DEFAULT_TRAITS: DEFAULT_TRAITS,
-              INPUTS: INPUTS, OUTPUTS: OUTPUTS, NH: NH, NW: NW, createWorld: createWorld, step: step, advanceTo: advanceTo, tickAt: tickAt,
+              INPUTS: INPUTS, OUTPUTS: OUTPUTS, NH: NH, NW: NW, createWorld: createWorld, step: step, advanceTo: advanceTo, advanceToTick: advanceToTick, tickAt: tickAt, tickAtF: tickAtF, timeOfTick: timeOfTick, clockRate: clockRate, setClockRate: setClockRate,
               serialize: serialize, deserialize: deserialize, Stats: Stats, seasonInfo: seasonInfo, maxEnergy: maxEnergy, radius: radius,
               terrain: terrain, tileAt: tileAt, temperature: temperature, tanh: tanh, formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS };
   Stats.bind(api);
