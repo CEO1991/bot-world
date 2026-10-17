@@ -21,4 +21,4 @@ const t0 = Date.now();
 Sim.advanceTo(world, now);
 fs.writeFileSync(file, Sim.serialize(world) + '\n');
 console.log(`Advanced ${world.tick - before} ticks in ${Date.now() - t0} ms -> tick ${world.tick}, ` +
-  `age ${Sim.formatDuration(world.tick * Sim.CONFIG.tickMs)}, bots ${world.bots.length}, grass ${world.grass.length}`);
+  `age ${Sim.formatDuration(world.tick * Sim.CONFIG.tickMs)}, bots ${world.bots.length}, grass ${world.natural}, dropped food ${world.dropped}`);

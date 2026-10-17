@@ -1,7 +1,7 @@
 /* Bot World simulation core. Shared by the browser (index.html) and Node (scripts/advance.js).
- * Deterministic: only + - * / sqrt, Math.floor/round/min/max/imul and the seeded PRNG are used in the step
+ * Deterministic: only + - * / sqrt, Math.floor/round/min/max/abs/imul and seeded PRNGs are used in the step
  * (tanh is a rational approximation, angles use a precomputed table), so every JS engine produces the
- * same world from the same state. Rules are the functions in RULES. */
+ * same world from the same state. Nothing here hard-codes behaviour: bots act only through their brain outputs. */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory(require('./stats.js'));
   else root.BotSim = factory(root.BotStats);
@@ -9,53 +9,52 @@
   'use strict';
 
   var CONFIG = {
-    width: 1000, height: 625,
-    tickMs: 100,               // 10 ticks per real second
-    // energy model (per tick). sizeF = size / 14
-    baseMaxEnergy: 200,        // max energy = 200 * sizeF^2
-    drainBase: 0.01,           // * sizeF^2           (living cost)
-    drainPerSpeed: 0.0075,     // * speed * sizeF     (moving cost; speed is chosen by the brain)
-    drainPerVision: 0.00004,   // * vision            (seeing far costs energy)
-    grassRadius: 9,
-    grassEnergy: 25,
-    seasonTicks: 72000,        // 2 simulated hours per season -> 8-hour year
+    width: 1000, height: 625, tile: 25,      // terrain grid 40 x 25 tiles
+    tickMs: 100,
+    // energy (per tick); sizeF = size / 14
+    baseMaxEnergy: 200, drainBase: 0.008, drainPerThrust: 0.003, drainPerVision: 0.00004,
+    climbCost: 0.6,            // energy per unit of elevation climbed (x sizeF^2); downhill refunds half
+    coldCost: 0.015,            // extra drain per tick at full cold for a lone bot
+    warmRadius: 45,            // bots whose edges are within this distance warm each other
+    warmPerBot: 0.34,          // each close bot removes 34% of the cold cost (capped at 100%)
+    seasonTemp: [0.75, 1, 0.6, 0], // spring, summer, autumn, winter (1 = warm, 0 = cold)
+    // movement physics
+    friction: 0.9, waterFriction: 0.75, turnPerTick: 0.08, wallBounce: 0.5, carrySlow: 0.12,
+    // food
+    grassRadius: 9, grassEnergy: 25, maxCarry: 2, maxDropped: 60,
+    dropDecayTicks: 216000,    // dropped food rots after 6 simulated hours
+    ownDropGrace: 100,         // a bot ignores food it just dropped for 10 s
+    seasonTicks: 72000,
     seasons: [
       { name: 'Spring', spawn: 0.02,  cap: 30 },
-      { name: 'Summer', spawn: 0.03,  cap: 40 },
-      { name: 'Autumn', spawn: 0.015, cap: 22 },
-      { name: 'Winter', spawn: 0.012, cap: 16 }
+      { name: 'Summer', spawn: 0.033, cap: 42 },
+      { name: 'Autumn', spawn: 0.024, cap: 32 },
+      { name: 'Winter', spawn: 0.012, cap: 14 }
     ],
-    strengthMin: 0.7, strengthMax: 1.3,
-    startGrass: 15,
+    strengthMin: 0.7, strengthMax: 1.3, startGrass: 15,
+    // signals
+    signalRange: 250,
     // brain
-    thinkEvery: 5,             // each bot runs its brain every 5 ticks = 0.5 s (staggered)
-    maxTurn: 0.5,              // heading change per think at full turn output
-    // reproduction (the brain's "reproduce" output must be > 0 as well)
-    maxPop: 30,
-    reproEnergy: 0.6,          // needs >= 60% of max energy
-    reproMinAge: 6000,         // 10 min old
-    reproCooldown: 9000,       // 15 min between children
-    reproCost: 0.45,           // parent pays 45% of its max energy...
-    childEnergy: 0.35,         // ...child starts with 35% of its own max
-    // mutation of brain weights (stored as integers in thousandths)
+    thinkEvery: 10,            // each bot thinks every 1 s (staggered); forces apply every tick
+    // reproduction (brain's reproduce output must be > 0 too)
+    maxPop: 30, reproEnergy: 0.5, reproMinAge: 3000, reproCooldown: 9000, reproCost: 0.45, childEnergy: 0.35,
     mutRate: 0.08, mutSd: 0.25, bigMutChance: 0.04, bigMutSd: 0.6, wMax: 4,
-    hallOfFame: 4,             // best genomes kept to seed re-sprouts
-    resproutDelayTicks: 50,
-    pairSize: 2
+    hallOfFame: 4, resproutDelayTicks: 50, pairSize: 2
   };
 
   var TRAITS = ['speed', 'vision', 'size'];
   var DEFAULT_TRAITS = { speed: 4, vision: 150, size: 14 };
   var TRAIT_RULES = { speed: { sd: 0.25, min: 1, max: 8 }, vision: { sd: 10, min: 40, max: 320 }, size: { sd: 0.8, min: 8, max: 24 } };
 
-  // Brain layout: inputs -> hidden (tanh) -> outputs (tanh). The last input is a constant bias.
-  var INPUTS = ['energy', 'grassNear', 'grassSide', 'grassAhead', 'botNear', 'botSide', 'botAhead', 'botEnergy', 'botSignal',
-                'crowd', 'seasonSin', 'seasonCos', 'abundance', 'age', 'memory', 'bias'];
-  var OUTPUTS = ['turn', 'speed', 'reproduce', 'memory', 'signal'];
-  var NI = INPUTS.length, NH = 7, NO = OUTPUTS.length;
-  var NW = NI * NH + (NH + 1) * NO; // hidden has its own bias unit for outputs
+  var INPUTS = ['energy', 'grassNear', 'grassSide', 'grassAhead', 'botNear', 'botSide', 'botAhead', 'botEnergy', 'botKin',
+                'crowd', 'seasonSin', 'seasonCos', 'abundance', 'age', 'memory', 'warmth',
+                'onWater', 'elevation', 'fertilityAhead', 'slopeAhead', 'carrying',
+                'signalSide', 'signalAhead', 'signal1', 'signal2', 'speed', 'bias'];
+  var OUTPUTS = ['turn', 'thrust', 'reproduce', 'memory', 'signal1', 'signal2', 'pickUp', 'drop', 'eatCarried'];
+  var NI = INPUTS.length, NH = 8, NO = OUTPUTS.length;
+  var NW = NI * NH + (NH + 1) * NO;
 
-  // Deterministic 64-direction table (own Taylor series; Math.sin/cos differ between engines).
+  // Deterministic 64-direction table.
   var DIRS = 64, DX = [], DY = [];
   (function () {
     var PI = 3.141592653589793;
@@ -64,44 +63,134 @@
     for (var i = 0; i < DIRS; i++) { var a = (i < DIRS / 2 ? i : i - DIRS) * 2 * PI / DIRS; DX.push(cosT(a)); DY.push(sinT(a)); }
   })();
 
-  function rand(w) {   // mulberry32; state lives in world.rng
-    var t = (w.rng = (w.rng + 0x6D2B79F5) >>> 0);
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  function mulberry(state) {
+    var t = (state + 0x6D2B79F5) >>> 0, r = t;
+    r = Math.imul(r ^ (r >>> 15), r | 1); r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
+    return { state: t, value: ((r ^ (r >>> 14)) >>> 0) / 4294967296 };
   }
+  function rand(w) { var m = mulberry(w.rng); w.rng = m.state; return m.value; }
   function randInt(w, lo, hi) { return lo + Math.floor(rand(w) * (hi - lo + 1)); }
-  function gauss(w) { return (rand(w) + rand(w) + rand(w) - 1.5) * 2; } // ~N(0,1)-ish
+  function gauss(w) { return (rand(w) + rand(w) + rand(w) - 1.5) * 2; }
   function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
-  // Rational tanh approximation (exact same result on every engine; error < 0.02).
   function tanh(x) { if (x > 3) return 1; if (x < -3) return -1; var x2 = x * x; return x * (27 + x2) / (27 + 9 * x2); }
 
-  var VERSION = 6;
+  var VERSION = 7;
   var H = Stats.hooks;
   var PAIR = [{ name: 'Blue', hue: 195 }, { name: 'Orange', hue: 25 }];
 
+  // ---------------- runtime caches (never saved; rebuilt from the save) ----------------
+  var RT = typeof WeakMap === 'function' ? new WeakMap() : null, RT_FALLBACK = null;
+  function rt(w) {
+    var r = RT ? RT.get(w) : (RT_FALLBACK && RT_FALLBACK.w === w ? RT_FALLBACK : null);
+    if (r) return r;
+    r = { w: w, terrain: terrainFor(w.terrainSeed), food: null, bots: null };
+    r.food = foodGridBuild(w);
+    if (RT) RT.set(w, r); else RT_FALLBACK = r;
+    return r;
+  }
+
+  // ---------------- terrain (fixed per world, derived from terrainSeed) ----------------
+  var TERRAIN_CACHE = {};
+  function terrainFor(seed) {
+    if (TERRAIN_CACHE[seed]) return TERRAIN_CACHE[seed];
+    var TW = CONFIG.width / CONFIG.tile, TH = CONFIG.height / CONFIG.tile, N = TW * TH, st = seed >>> 0;
+    function r() { var m = mulberry(st); st = m.state; return m.value; }
+    // elevation: two octaves of value noise, bilinear (only + - * /)
+    var elev = new Float64Array(N), i, x, y;
+    function octave(cells, amp) {
+      var gw = cells + 1, gh = Math.ceil(cells * TH / TW) + 1, grid = [];
+      for (i = 0; i < gw * gh; i++) grid.push(r());
+      for (y = 0; y < TH; y++) for (x = 0; x < TW; x++) {
+        var fx = x / TW * cells, fy = y / TH * (gh - 1), ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy;
+        var a = grid[iy * gw + ix], b = grid[iy * gw + ix + 1], c = grid[(iy + 1) * gw + ix], d = grid[(iy + 1) * gw + ix + 1];
+        tx = tx * tx * (3 - 2 * tx); ty = ty * ty * (3 - 2 * ty);
+        elev[y * TW + x] += amp * ((a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty);
+      }
+    }
+    octave(4, 0.7); octave(10, 0.3);
+    var water = new Uint8Array(N);
+    function carve(px, py, dx, dy, steps) {   // a river wanders downhill-ish across the map
+      for (var s = 0; s < steps; s++) {
+        if (px < 0 || py < 0 || px >= TW || py >= TH) return;
+        water[py * TW + px] = 1;
+        var side = dx === 0 ? 1 : 0;           // widen the river to 2 tiles
+        var qx = px + side, qy = py + (1 - side); if (qx < TW && qy < TH) water[qy * TW + qx] = 1;
+        var best = 0, bv = Infinity;
+        for (var o = -1; o <= 1; o++) {
+          var nx = px + dx + (dx === 0 ? o : 0), ny = py + dy + (dy === 0 ? o : 0);
+          if (nx < 0 || ny < 0 || nx >= TW || ny >= TH) continue;
+          var v = elev[ny * TW + nx] + r() * 0.25;
+          if (v < bv) { bv = v; best = o; }
+        }
+        px += dx + (dx === 0 ? best : 0); py += dy + (dy === 0 ? best : 0);
+      }
+    }
+    carve(Math.floor(TW * (0.25 + r() * 0.5)), 0, 0, 1, TH + 5);
+    if (r() < 0.7) carve(0, Math.floor(TH * (0.2 + r() * 0.6)), 1, 0, Math.floor(TW * (0.4 + r() * 0.6)));
+    for (i = 0; i < N; i++) if (water[i]) elev[i] = Math.min(elev[i], 0.2);
+    // distance to water (tiles, Chebyshev) and fertility
+    var dist = new Uint8Array(N), fert = new Float64Array(N), total = 0, cum = new Float64Array(N), bank = new Uint8Array(N), bankTiles = 0, landTiles = 0;
+    for (i = 0; i < N; i++) dist[i] = water[i] ? 0 : 99;
+    for (var pass = 0; pass < 6; pass++) for (y = 0; y < TH; y++) for (x = 0; x < TW; x++) {
+      var k = y * TW + x; if (dist[k] === 0) continue; var m = dist[k];
+      for (var oy = -1; oy <= 1; oy++) for (var ox = -1; ox <= 1; ox++) {
+        var xx = x + ox, yy = y + oy; if (xx < 0 || yy < 0 || xx >= TW || yy >= TH) continue;
+        var dd = dist[yy * TW + xx] + 1; if (dd < m) m = dd;
+      }
+      dist[k] = m;
+    }
+    for (i = 0; i < N; i++) {
+      var f = water[i] ? 0 : dist[i] === 1 ? 1 : dist[i] === 2 ? 0.7 : dist[i] === 3 ? 0.4 : elev[i] > 0.62 ? 0.05 : 0.15;
+      fert[i] = f; total += f; cum[i] = total;
+      if (!water[i]) { landTiles++; if (dist[i] <= 2) { bank[i] = 1; bankTiles++; } }
+    }
+    var T = { TW: TW, TH: TH, elev: elev, water: water, fert: fert, cum: cum, total: total, dist: dist, bank: bank, bankFrac: bankTiles / Math.max(1, landTiles) };
+    TERRAIN_CACHE[seed] = T; return T;
+  }
+  function tileAt(T, x, y) {
+    var tx = Math.floor(x / CONFIG.tile), ty = Math.floor(y / CONFIG.tile);
+    if (tx < 0) tx = 0; if (ty < 0) ty = 0; if (tx >= T.TW) tx = T.TW - 1; if (ty >= T.TH) ty = T.TH - 1;
+    return ty * T.TW + tx;
+  }
+
+  // ---------------- food spatial grid (ground items) ----------------
+  var CELL = 50, GW = Math.ceil(CONFIG.width / CELL), GH = Math.ceil(CONFIG.height / CELL);
+  var HEAD = new Int32Array(GW * GH), NEXT = new Int32Array(64);
+  function cellOf(x, y) { var cx = Math.floor(x / CELL), cy = Math.floor(y / CELL); if (cx < 0) cx = 0; if (cy < 0) cy = 0; if (cx >= GW) cx = GW - 1; if (cy >= GH) cy = GH - 1; return cy * GW + cx; }
+  function foodGridBuild(w) { var g = []; for (var i = 0; i < GW * GH; i++) g.push([]); for (i = 0; i < w.grass.length; i++) g[cellOf(w.grass[i].x, w.grass[i].y)].push(w.grass[i]); return g; }
+  function addFood(w, f) { w.grass.push(f); rt(w).food[cellOf(f.x, f.y)].push(f); if (f.drop) w.dropped++; else w.natural++; }
+  function removeFood(w, f) {
+    var c = rt(w).food[cellOf(f.x, f.y)]; c.splice(c.indexOf(f), 1);
+    w.grass.splice(w.grass.indexOf(f), 1); if (f.drop) w.dropped--; else w.natural--;
+  }
+
+  // ---------------- bodies ----------------
   function sizeF(b) { return b.traits.size / 14; }
   function maxEnergy(b) { var f = sizeF(b); return CONFIG.baseMaxEnergy * f * f; }
   function radius(b) { return b.traits.size; }
-  function drain(b) {
-    var f = sizeF(b);
-    return CONFIG.drainBase * f * f + CONFIG.drainPerSpeed * b.speed * f + CONFIG.drainPerVision * b.traits.vision;
+  function temperature(w, T, b) {   // environment warmth at the bot (0 cold .. 1 warm)
+    var k = tileAt(T, b.x, b.y), t = CONFIG.seasonTemp[Math.floor(w.tick / CONFIG.seasonTicks) % 4];
+    if (T.water[k]) t -= 0.15; t -= 0.15 * Math.max(0, T.elev[k] - 0.5);
+    return clamp(t, 0, 1);
   }
-
   function seasonInfo(w, tick) {
     var t = tick === undefined ? w.tick : tick, len = CONFIG.seasonTicks;
     var idx = Math.floor(t / len) % 4, year = Math.floor(t / (4 * len));
     var s = CONFIG.seasons[idx], k = w.yearStrength, m = idx === 3 ? 1 / k : k;
     return { index: idx, name: s.name, year: year, strength: k, spawn: s.spawn * m,
-             cap: Math.max(1, Math.round(s.cap * m)), endsAt: (Math.floor(t / len) + 1) * len };
+             cap: Math.max(1, Math.round(s.cap * m)), endsAt: (Math.floor(t / len) + 1) * len, temp: CONFIG.seasonTemp[idx] };
   }
 
-  // ---- genomes ----
-  function randomBrain(w) { var g = []; for (var i = 0; i < NW; i++) g.push(Math.round((rand(w) - 0.5) * 1000)); return g; } // weights in [-0.5, 0.5]
+  // ---------------- genomes ----------------
+  function randomBrain(w) { var g = []; for (var i = 0; i < NW; i++) g.push(Math.round((rand(w) - 0.5) * 1000)); return g; }
+  function fitBrain(w, g) {   // pads (small random weights) or trims a genome of another size, e.g. from an older layout
+    if (g.length === NW) return g;
+    var c = g.slice(0, NW); while (c.length < NW) c.push(Math.round((rand(w) - 0.5) * 200)); return c;
+  }
   function mutateBrain(w, g, strong) {
-    var c = g.slice(), big = strong || rand(w) < CONFIG.bigMutChance, lim = CONFIG.wMax * 1000;
+    var c = fitBrain(w, g).slice(), big = strong || rand(w) < CONFIG.bigMutChance, lim = CONFIG.wMax * 1000;
     for (var i = 0; i < c.length; i++) {
-      if (big) c[i] = clamp(Math.round(c[i] + gauss(w) * CONFIG.bigMutSd * 1000 * 0.5), -lim, lim);
+      if (big) c[i] = clamp(Math.round(c[i] + gauss(w) * CONFIG.bigMutSd * 500), -lim, lim);
       else if (rand(w) < CONFIG.mutRate) c[i] = clamp(Math.round(c[i] + gauss(w) * CONFIG.mutSd * 1000), -lim, lim);
     }
     return { brain: c, big: big };
@@ -111,35 +200,44 @@
     for (var i = 0; i < TRAITS.length; i++) { var k = TRAITS[i], r = TRAIT_RULES[k]; c[k] = Math.round(clamp(t[k] + gauss(w) * r.sd, r.min, r.max) * 1000) / 1000; }
     return c;
   }
+  var WCACHE = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function weights(g) {
+    var f = WCACHE && WCACHE.get(g); if (f) return f;
+    f = new Float64Array(g.length); for (var i = 0; i < g.length; i++) f[i] = g[i] / 1000;
+    if (WCACHE) WCACHE.set(g, f); return f;
+  }
 
   function makeBot(w, o) {
     var b = { id: w.nextId++, name: o.name, gen: o.gen || 1, parent: o.parent || null, lineage: o.lineage || null,
-              hue: o.hue, traits: o.traits, brain: o.brain, x: o.x, y: o.y, px: o.x, py: o.y, hx: 0, hy: 0,
-              energy: 0, born: w.tick, lastRepro: w.tick, kids: 0, speed: 0, want: 0, mem: 0, sig: 0 };
+              hue: o.hue, traits: o.traits, brain: o.brain, x: o.x, y: o.y, px: o.x, py: o.y, hx: 0, hy: 0, vx: 0, vy: 0,
+              energy: 0, born: w.tick, lastRepro: w.tick, kids: 0, th: 0, tu: 0, want: 0, mem: 0, s1: 0, s2: 0,
+              pick: 0, drop: 0, eatC: 0, carry: [], warm: 0, bx: o.x, by: o.y };
     if (!b.lineage) b.lineage = b.id;
     b.energy = o.energy === undefined ? maxEnergy(b) : o.energy;
     var d = randInt(w, 0, DIRS - 1); b.hx = DX[d]; b.hy = DY[d];
-    b.speed = b.traits.speed * 0.5;
     w.bots.push(b); H.birth(w, b, o.why);
     return b;
   }
-  function freshPair(w, why, randomPos) {
+  function landSpot(w) {   // random position not in water
+    var T = rt(w).terrain;
+    for (var k = 0; k < 20; k++) { var x = 30 + rand(w) * (CONFIG.width - 60), y = 30 + rand(w) * (CONFIG.height - 60); if (!T.water[tileAt(T, x, y)]) return [x, y]; }
+    return [x, y];
+  }
+  function freshPair(w, why) {
     var hof = w.hof || [];
     for (var i = 0; i < CONFIG.pairSize; i++) {
-      var x = randomPos ? 30 + rand(w) * (CONFIG.width - 60) : (i === 0 ? 0.25 : 0.75) * CONFIG.width;
-      var y = randomPos ? 30 + rand(w) * (CONFIG.height - 60) : CONFIG.height / 2;
-      var src = hof.length ? hof[i % hof.length] : null, t = {}, k;
-      if (src) {  // re-sprout from the hall of fame (mutated), so evolution isn't lost between eras
+      var p = landSpot(w), src = hof.length ? hof[i % hof.length] : null, t = {}, k;
+      if (src) {
         makeBot(w, { name: src.name.split(' ')[0] + ' ' + (w.stats.era), hue: src.hue, traits: mutateTraits(w, src.traits),
-                     brain: mutateBrain(w, src.brain, false).brain, x: x, y: y, why: why + ', descended from hall-of-fame #' + src.id });
+                     brain: mutateBrain(w, src.brain, false).brain, x: p[0], y: p[1], why: why + ', descended from hall-of-fame #' + src.id });
       } else {
-        var p = PAIR[i % PAIR.length];
+        var q = PAIR[i % PAIR.length];
         for (k in DEFAULT_TRAITS) t[k] = DEFAULT_TRAITS[k];
-        makeBot(w, { name: p.name + (w.stats.era > 1 ? ' ' + w.stats.era : ''), hue: p.hue, traits: t, brain: randomBrain(w), x: x, y: y, why: why + ', random brain' });
+        makeBot(w, { name: q.name + (w.stats.era > 1 ? ' ' + w.stats.era : ''), hue: q.hue, traits: t, brain: randomBrain(w), x: p[0], y: p[1], why: why + ', random brain' });
       }
     }
   }
-  function remember(w, b) {   // hall of fame: score = lifetime + 2h per child
+  function remember(w, b) {
     var score = (w.tick - b.born) + 72000 * b.kids, hof = w.hof;
     if (hof.length >= CONFIG.hallOfFame && score <= hof[hof.length - 1].score) return;
     hof.push({ id: b.id, name: b.name, gen: b.gen, hue: b.hue, score: score, kids: b.kids, lived: w.tick - b.born, traits: b.traits, brain: b.brain });
@@ -147,71 +245,77 @@
     if (hof.length > CONFIG.hallOfFame) hof.length = CONFIG.hallOfFame;
   }
 
-  function spawnGrass(w) {
-    var r = CONFIG.grassRadius;
-    w.grass.push({ id: w.nextId++, x: r + rand(w) * (CONFIG.width - 2 * r), y: r + rand(w) * (CONFIG.height - 2 * r), born: w.tick });
+  function spawnGrass(w) {   // weighted by fertility
+    var T = rt(w).terrain, target = rand(w) * T.total, lo = 0, hi = T.cum.length - 1;
+    while (lo < hi) { var mid = (lo + hi) >> 1; if (T.cum[mid] < target) lo = mid + 1; else hi = mid; }
+    var tx = lo % T.TW, ty = Math.floor(lo / T.TW), r = CONFIG.grassRadius;
+    var x = clamp((tx + rand(w)) * CONFIG.tile, r, CONFIG.width - r), y = clamp((ty + rand(w)) * CONFIG.tile, r, CONFIG.height - r);
+    addFood(w, { id: w.nextId++, x: x, y: y, born: w.tick });
     H.grassSpawn(w);
   }
 
   function createWorld(seed, startTime) {
-    var w = { version: VERSION, seed: seed >>> 0, rng: seed >>> 0, startTime: startTime, tick: 0, nextId: 1,
-              bots: [], grass: [], hof: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
+    var w = { version: VERSION, seed: seed >>> 0, rng: seed >>> 0, terrainSeed: (seed ^ 0x9E3779B9) >>> 0, startTime: startTime, tick: 0, nextId: 1,
+              bots: [], grass: [], natural: 0, dropped: 0, hof: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
     Stats.event(w, 'world', 'World created');
-    freshPair(w, 'first pair', false);
     for (var i = 0; i < CONFIG.startGrass; i++) spawnGrass(w);
+    freshPair(w, 'first pair');
     return w;
   }
 
-  // ---- brain: sense -> think -> act ----
+  // ---------------- brain: sense -> think ----------------
   var IN = new Float64Array(NI), HID = new Float64Array(NH + 1), OUT = new Float64Array(NO);
-  // Decoded weights (thousandths -> floats) cached per genome array; genomes are never modified in place.
-  var CACHE = typeof WeakMap === 'function' ? new WeakMap() : null;
-  function weights(g) {
-    var f = CACHE && CACHE.get(g); if (f) return f;
-    f = new Float64Array(g.length); for (var i = 0; i < g.length; i++) f[i] = g[i] / 1000;
-    if (CACHE) CACHE.set(g, f); return f;
-  }
-  function think(w, b, info) {
-    var T = b.traits, vis2 = T.vision * T.vision, hx = b.hx, hy = b.hy, i, j;
-    var g = null, gd = vis2;
-    var V = T.vision, bx = b.x, by = b.y, G = w.grass, BS = w.bots;
+  function think(w, b, info, T) {
+    var Tr = b.traits, V = Tr.vision, vis2 = V * V, hx = b.hx, hy = b.hy, bx = b.x, by = b.y, i, j;
+    var G = w.grass, g = null, gd = vis2;
     for (i = 0; i < G.length; i++) { var q = G[i], dx = q.x - bx; if (dx > V || dx < -V) continue;
       var dy = q.y - by, d = dx * dx + dy * dy; if (d <= gd) { gd = d; g = q; } }
-    var o = null, od = vis2, crowd = 0;
+    var BS = w.bots, o = null, od = vis2, crowd = 0, warmN = 0, sb = null, sbest = 0, SR = CONFIG.signalRange, R = radius(b);
     for (i = 0; i < BS.length; i++) {
       var p = BS[i]; if (p === b) continue;
-      var ex = p.x - bx; if (ex > V || ex < -V) continue;
+      var ex = p.x - bx; if (ex > SR + V || ex < -SR - V) continue;
       var ey = p.y - by, e = ex * ex + ey * ey;
       if (e <= vis2) { crowd++; if (e < od) { od = e; o = p; } }
+      var wr = CONFIG.warmRadius + R + radius(p); if (e < wr * wr) warmN++;
+      if (e < SR * SR) { var strength = (Math.abs(p.s1) + Math.abs(p.s2)) * (1 - Math.sqrt(e) / SR); if (strength > sbest) { sbest = strength; sb = p; } }
     }
-    var mx = maxEnergy(b), E = b.energy / mx;
+    b.warm = Math.min(1, warmN * CONFIG.warmPerBot);
+    var mx = maxEnergy(b), E = b.energy / mx, k0 = tileAt(T, bx, by), ahead = tileAt(T, bx + hx * 40, by + hy * 40);
     IN[0] = E;
-    if (g) { var gl = Math.sqrt(gd) || 1, gx = (g.x - b.x) / gl, gy = (g.y - b.y) / gl;
-      IN[1] = 1 - gl / T.vision; IN[2] = hx * gy - hy * gx; IN[3] = hx * gx + hy * gy; }
+    if (g) { var gl = Math.sqrt(gd) || 1, gx = (g.x - bx) / gl, gy = (g.y - by) / gl; IN[1] = 1 - gl / V; IN[2] = hx * gy - hy * gx; IN[3] = hx * gx + hy * gy; }
     else { IN[1] = 0; IN[2] = 0; IN[3] = 0; }
-    if (o) { var ol = Math.sqrt(od) || 1, ux = (o.x - b.x) / ol, uy = (o.y - b.y) / ol;
-      IN[4] = 1 - ol / T.vision; IN[5] = hx * uy - hy * ux; IN[6] = hx * ux + hy * uy; IN[7] = o.energy / maxEnergy(o); IN[8] = o.sig; }
+    if (o) { var ol = Math.sqrt(od) || 1, ux = (o.x - bx) / ol, uy = (o.y - by) / ol;
+      IN[4] = 1 - ol / V; IN[5] = hx * uy - hy * ux; IN[6] = hx * ux + hy * uy; IN[7] = o.energy / maxEnergy(o); IN[8] = o.lineage === b.lineage ? 1 : 0; }
     else { IN[4] = 0; IN[5] = 0; IN[6] = 0; IN[7] = 0; IN[8] = 0; }
     IN[9] = crowd / 5;
     var ph = Math.floor((w.tick % (4 * CONFIG.seasonTicks)) * DIRS / (4 * CONFIG.seasonTicks));
     IN[10] = DY[ph]; IN[11] = DX[ph];
-    IN[12] = w.grass.length / info.cap;
+    IN[12] = w.natural / info.cap;
     IN[13] = Math.min(1, (w.tick - b.born) / 72000);
-    IN[14] = b.mem; IN[15] = 1;
+    IN[14] = b.mem;
+    var temp = temperature(w, T, b); IN[15] = Math.min(1, temp + (1 - temp) * b.warm);
+    IN[16] = T.water[k0]; IN[17] = T.elev[k0]; IN[18] = T.fert[ahead]; IN[19] = (T.elev[ahead] - T.elev[k0]) * 4;
+    IN[20] = b.carry.length / CONFIG.maxCarry;
+    if (sb) { var sl = Math.sqrt((sb.x - bx) * (sb.x - bx) + (sb.y - by) * (sb.y - by)) || 1, sx = (sb.x - bx) / sl, sy = (sb.y - by) / sl;
+      IN[21] = hx * sy - hy * sx; IN[22] = hx * sx + hy * sy; IN[23] = sb.s1; IN[24] = sb.s2; }
+    else { IN[21] = 0; IN[22] = 0; IN[23] = 0; IN[24] = 0; }
+    IN[25] = Math.sqrt(b.vx * b.vx + b.vy * b.vy) / Tr.speed; IN[26] = 1;
     var W = weights(b.brain), k = 0, s;
     for (j = 0; j < NH; j++) { s = 0; for (i = 0; i < NI; i++) s += IN[i] * W[k++]; HID[j] = tanh(s); }
     HID[NH] = 1;
     for (j = 0; j < NO; j++) { s = 0; for (i = 0; i <= NH; i++) s += HID[i] * W[k++]; OUT[j] = tanh(s); }
-    // act
-    var turn = OUT[0] * CONFIG.maxTurn;
-    var nx = hx - hy * turn, ny = hy + hx * turn, nl = Math.sqrt(nx * nx + ny * ny);
-    b.hx = nx / nl; b.hy = ny / nl;
-    b.speed = T.speed * (OUT[1] + 1) / 2;
-    b.want = OUT[2]; b.mem = OUT[3]; b.sig = OUT[4];
-    H.perceive(w, b, E, g ? IN[3] : null, o, o ? IN[6] : null, (OUT[1] + 1) / 2, info);
+    b.tu = OUT[0]; b.th = OUT[1] > 0 ? OUT[1] : OUT[1] * 0.3; b.want = OUT[2]; b.mem = OUT[3]; b.s1 = OUT[4]; b.s2 = OUT[5];
+    b.pick = OUT[6]; b.drop = OUT[7]; b.eatC = OUT[8];
+    H.perceive(w, b, { E: E, grassAhead: g ? IN[3] : null, other: o, temp: temp, bank: T.bank[k0], tile: k0, warm: IN[15] });
   }
 
-  // ---- Rules: each is fn(world), run in order every tick. ----
+  function eatItem(w, b, item, how) {
+    var before = b.energy, mx = maxEnergy(b);
+    b.energy = Math.min(mx, b.energy + CONFIG.grassEnergy);
+    H.eat(w, b, b.energy - before, CONFIG.grassEnergy - (b.energy - before), item, how);
+  }
+
+  // ---------------- rules ----------------
   var RULES = [
     function seasons(w) {
       var y = Math.floor(w.tick / (4 * CONFIG.seasonTicks));
@@ -220,48 +324,98 @@
     },
     function growGrass(w) {
       var s = seasonInfo(w);
-      if (rand(w) < s.spawn && w.grass.length < s.cap) spawnGrass(w);
+      if (rand(w) < s.spawn && w.natural < s.cap) spawnGrass(w);
+      if (w.tick % 600 === 0 && w.dropped > 0) {          // dropped food slowly rots
+        for (var i = w.grass.length - 1; i >= 0; i--) { var f = w.grass[i]; if (f.drop && w.tick >= f.rotAt) { removeFood(w, f); H.rot(w, f); } }
+      }
     },
     function resprout(w) {
       if (w.bots.length > 0 || w.resproutAt === null || w.tick < w.resproutAt) return;
-      w.resproutAt = null;
-      H.newEra(w);
-      freshPair(w, 'new life after extinction', true);
+      w.resproutAt = null; H.newEra(w); freshPair(w, 'new life after extinction');
     },
     function brains(w) {
-      var n = CONFIG.thinkEvery, info = seasonInfo(w);
-      for (var i = 0; i < w.bots.length; i++) { var b = w.bots[i]; if ((w.tick + b.id) % n === 0) think(w, b, info); }
+      var n = CONFIG.thinkEvery, info = seasonInfo(w), T = rt(w).terrain;
+      for (var i = 0; i < w.bots.length; i++) { var b = w.bots[i]; if ((w.tick + b.id) % n === 0) think(w, b, info, T); }
     },
-    function move(w) {
-      var W = CONFIG.width, Hh = CONFIG.height;
-      for (var i = 0; i < w.bots.length; i++) {
-        var b = w.bots[i], R = radius(b);
+    function physics(w) {
+      var T = rt(w).terrain, W = CONFIG.width, Hh = CONFIG.height, BS = w.bots, i, j;
+      for (i = 0; i < BS.length; i++) {
+        var b = BS[i], R = radius(b), sp = b.traits.speed;
         b.px = b.x; b.py = b.y;
-        b.x += b.hx * b.speed; b.y += b.hy * b.speed;
-        if (b.x < R) { b.x = R; b.hx = -b.hx; }
-        if (b.x > W - R) { b.x = W - R; b.hx = -b.hx; }
-        if (b.y < R) { b.y = R; b.hy = -b.hy; }
-        if (b.y > Hh - R) { b.y = Hh - R; b.hy = -b.hy; }
+        // turning force and thrust (inertia + friction)
+        var t = b.tu * CONFIG.turnPerTick, nx = b.hx - b.hy * t, ny = b.hy + b.hx * t, nl = Math.sqrt(nx * nx + ny * ny);
+        b.hx = nx / nl; b.hy = ny / nl;
+        var k0 = tileAt(T, b.x, b.y), fr = T.water[k0] ? CONFIG.waterFriction : CONFIG.friction;
+        var acc = sp * (1 - CONFIG.friction) * b.th * (1 - CONFIG.carrySlow * b.carry.length);
+        b.vx = (b.vx + b.hx * acc) * fr; b.vy = (b.vy + b.hy * acc) * fr;
+        b.x += b.vx; b.y += b.vy;
+        // walls: bounce the velocity and turn the body away (a bot pushing into a wall glances off it)
+        if (b.x < R) { b.x = R; b.vx = -b.vx * CONFIG.wallBounce; if (b.hx < 0) b.hx = -b.hx; }
+        if (b.x > W - R) { b.x = W - R; b.vx = -b.vx * CONFIG.wallBounce; if (b.hx > 0) b.hx = -b.hx; }
+        if (b.y < R) { b.y = R; b.vy = -b.vy * CONFIG.wallBounce; if (b.hy < 0) b.hy = -b.hy; }
+        if (b.y > Hh - R) { b.y = Hh - R; b.vy = -b.vy * CONFIG.wallBounce; if (b.hy > 0) b.hy = -b.hy; }
+        b.k0 = k0;
       }
-    },
-    function drainEnergy(w) {
-      for (var i = 0; i < w.bots.length; i++) {
-        var b = w.bots[i], cost = drain(b), d = Math.min(cost, b.energy);
-        b.energy -= cost; H.spend(w, b, d);
-      }
-    },
-    function eatGrass(w) {
-      for (var i = 0; i < w.bots.length; i++) {
-        var b = w.bots[i], reach = radius(b) + CONFIG.grassRadius, r2 = reach * reach, mx = maxEnergy(b);
-        for (var j = w.grass.length - 1; j >= 0; j--) {
-          var g = w.grass[j], dx = g.x - b.x; if (dx > reach || dx < -reach) continue;
-          var dy = g.y - b.y;
-          if (dx * dx + dy * dy < r2) {
-            var before = b.energy;
-            b.energy = Math.min(mx, b.energy + CONFIG.grassEnergy);
-            H.eat(w, b, b.energy - before, CONFIG.grassEnergy - (b.energy - before));
-            w.grass.splice(j, 1);
+      // soft collisions between bots (spatial grid as linked lists in reusable typed arrays)
+      var n = BS.length; if (n < 2) return;
+      if (NEXT.length < n) NEXT = new Int32Array(n * 2);
+      HEAD.fill(-1);
+      for (i = 0; i < n; i++) { var c = cellOf(BS[i].x, BS[i].y); NEXT[i] = HEAD[c]; HEAD[c] = i; }
+      for (i = 0; i < n; i++) {
+        var a = BS[i], cx = Math.floor(a.x / CELL), cy = Math.floor(a.y / CELL), ra = radius(a);
+        for (var oy = -1; oy <= 1; oy++) for (var ox = -1; ox <= 1; ox++) {
+          var gx = cx + ox, gy = cy + oy; if (gx < 0 || gy < 0 || gx >= GW || gy >= GH) continue;
+          for (j = HEAD[gy * GW + gx]; j !== -1; j = NEXT[j]) {
+            if (j <= i) continue;
+            var o = BS[j], dx = o.x - a.x, dy = o.y - a.y, d2 = dx * dx + dy * dy, rr = ra + radius(o);
+            if (d2 >= rr * rr || d2 === 0) continue;
+            var d = Math.sqrt(d2), ux = dx / d, uy = dy / d, push = (rr - d) * 0.5;
+            a.x -= ux * push; a.y -= uy * push; o.x += ux * push; o.y += uy * push;
+            var rv = (o.vx - a.vx) * ux + (o.vy - a.vy) * uy;
+            if (rv < 0) { var imp = rv * 0.5; a.vx += ux * imp; a.vy += uy * imp; o.vx -= ux * imp; o.vy -= uy * imp; }
           }
+        }
+      }
+    },
+    function energyUse(w) {
+      var T = rt(w).terrain, si = Math.floor(w.tick / CONFIG.seasonTicks) % 4, cold = (1 - CONFIG.seasonTemp[si]) * (si === 3 ? 1 / w.yearStrength : 1); // harsh years have colder winters
+      for (var i = 0; i < w.bots.length; i++) {
+        var b = w.bots[i], f = sizeF(b), f2 = f * f, k1 = tileAt(T, b.x, b.y);
+        var cost = CONFIG.drainBase * f2 + CONFIG.drainPerThrust * Math.abs(b.th) * b.traits.speed * f + CONFIG.drainPerVision * b.traits.vision;
+        var dh = T.elev[k1] - T.elev[b.k0 === undefined ? k1 : b.k0];
+        var climb = dh > 0 ? CONFIG.climbCost * dh * f2 : CONFIG.climbCost * 0.5 * dh * f2;
+        var c = cold + (T.water[k1] ? 0.15 : 0); if (c > 1.5) c = 1.5;
+        var heat = CONFIG.coldCost * c * (1 - b.warm) * f2;
+        cost = Math.max(0, cost + climb) + heat;
+        var d = Math.min(cost, b.energy); b.energy -= cost; H.spend(w, b, d, heat, climb);
+      }
+    },
+    function food(w) {   // touching food: pick it up (if the brain wants to and has room) or eat it (if not full)
+      var FG = rt(w).food, BS = w.bots, gr = CONFIG.grassRadius;
+      for (var i = 0; i < BS.length; i++) {
+        var b = BS[i], reach = radius(b) + gr, r2 = reach * reach, mx = maxEnergy(b);
+        var x0 = Math.max(0, Math.floor((b.x - reach) / CELL)), x1 = Math.min(GW - 1, Math.floor((b.x + reach) / CELL));
+        var y0 = Math.max(0, Math.floor((b.y - reach) / CELL)), y1 = Math.min(GH - 1, Math.floor((b.y + reach) / CELL));
+        for (var gy = y0; gy <= y1; gy++) for (var gx = x0; gx <= x1; gx++) {
+          var cell = FG[gy * GW + gx];
+          for (var j = cell.length - 1; j >= 0; j--) {
+            var f = cell[j]; if (j >= cell.length) continue;
+            var dx = f.x - b.x, dy = f.y - b.y; if (dx * dx + dy * dy >= r2) continue;
+            if (f.drop && f.dropper === b.id && w.tick - f.dropTick < CONFIG.ownDropGrace) continue;
+            if (b.pick > 0.5 && b.carry.length < CONFIG.maxCarry) {
+              removeFood(w, f); b.carry.push({ id: f.id, born: f.born, picked: w.tick, dropper: f.dropper || null, dropLin: f.dropLin || null, dropTick: f.dropTick || null, corpse: f.corpse || 0 });
+              H.pickup(w, b, f);
+            } else if (b.energy < mx - 1) { removeFood(w, f); eatItem(w, b, f, f.drop ? 'ground-drop' : 'ground'); }
+          }
+        }
+        // eat from what it carries
+        if (b.eatC > 0 && b.carry.length && b.energy <= mx - CONFIG.grassEnergy * 0.5) { var it = b.carry.shift(); eatItem(w, b, it, 'carried'); }
+        // drop something
+        if (b.drop > 0.5 && b.carry.length && w.dropped < CONFIG.maxDropped && (w.tick + b.id) % CONFIG.thinkEvery === 0) {
+          var c2 = b.carry.shift();
+          var fx = clamp(b.x - b.hx * (radius(b) + gr + 2), gr, CONFIG.width - gr), fy = clamp(b.y - b.hy * (radius(b) + gr + 2), gr, CONFIG.height - gr);
+          var dropped = { id: c2.id, x: fx, y: fy, born: c2.born, drop: 1, dropper: b.id, dropLin: b.lineage, dropTick: w.tick, rotAt: w.tick + CONFIG.dropDecayTicks, picked: c2.picked };
+          addFood(w, dropped); H.dropped(w, b, dropped);
         }
       }
     },
@@ -269,10 +423,10 @@
       var n = w.bots.length;
       for (var i = 0; i < n && w.bots.length < CONFIG.maxPop; i++) {
         var b = w.bots[i], mx = maxEnergy(b);
+        if ((w.tick + b.id) % CONFIG.thinkEvery !== 0) continue;
         if (b.energy < CONFIG.reproEnergy * mx || w.tick - b.born < CONFIG.reproMinAge || w.tick - b.lastRepro < CONFIG.reproCooldown) continue;
-        if (w.tick % CONFIG.thinkEvery !== 0) continue;      // eligibility checked once per think cycle
         H.eligible(w, b);
-        if (b.want <= 0) continue;                          // the brain decides whether to breed now
+        if (b.want <= 0) continue;
         b.energy -= CONFIG.reproCost * mx; b.lastRepro = w.tick; b.kids++;
         var m = mutateBrain(w, b.brain, false), t = mutateTraits(w, b.traits);
         var hue = Math.round((b.hue + gauss(w) * 6 + 360) % 360);
@@ -288,6 +442,10 @@
         if (w.bots[i].energy <= 0) {
           var b = w.bots[i];
           w.bots.splice(i, 1);
+          for (var c = 0; c < b.carry.length; c++) {        // carried food falls to the ground
+            var it = b.carry[c], gr = CONFIG.grassRadius;
+            if (w.dropped < CONFIG.maxDropped) addFood(w, { id: it.id, x: clamp(b.x, gr, CONFIG.width - gr), y: clamp(b.y, gr, CONFIG.height - gr), born: it.born, drop: 1, dropper: b.id, dropLin: b.lineage, dropTick: w.tick, rotAt: w.tick + CONFIG.dropDecayTicks, picked: it.picked, corpse: 1 });
+          }
           remember(w, b);
           H.death(w, b, 'starvation', formatDuration);
           if (w.bots.length === 0) { H.extinction(w, formatDuration); w.resproutAt = w.tick + CONFIG.resproutDelayTicks; }
@@ -296,7 +454,7 @@
     }
   ];
 
-  function step(w) { w.tick++; for (var i = 0; i < RULES.length; i++) RULES[i](w); H.tick(w); }
+  function step(w) { w.tick++; for (var i = 0; i < RULES.length; i++) RULES[i](w); H.tick(w, rt(w).terrain); }
   function tickAt(w, timeMs) { return Math.floor((timeMs - w.startTime) / CONFIG.tickMs); }
   function advanceTo(w, timeMs, maxSteps) {
     var target = tickAt(w, timeMs), n = 0;
@@ -309,30 +467,29 @@
     if (h) return h + 'h ' + m + 'm';
     return m + 'm ' + (s % 60) + 's';
   }
-  // Compact genome encoding for saves: each weight (-4000..4000) -> 2 chars of a 91-symbol alphabet.
-  var ALPHA = ''; for (var c = 35; c < 127; c++) if (c !== 92) ALPHA += String.fromCharCode(c);
+  var ALPHA = ''; for (var ch = 35; ch < 127; ch++) if (ch !== 92) ALPHA += String.fromCharCode(ch);
   function encodeBrain(g) { var out = ''; for (var i = 0; i < g.length; i++) { var v = g[i] + 4000; out += ALPHA[Math.floor(v / 91)] + ALPHA[v % 91]; } return out; }
   function decodeBrain(str) { var g = []; for (var i = 0; i < str.length; i += 2) g.push(ALPHA.indexOf(str[i]) * 91 + ALPHA.indexOf(str[i + 1]) - 4000); return g; }
   function serialize(w) {
     var copy = JSON.parse(JSON.stringify(w)); delete copy.config; Stats.compact(copy);
-    copy.bots.forEach(function (b) { b.brain = encodeBrain(b.brain); delete b.px; delete b.py; }); // px/py are render-only
+    copy.bots.forEach(function (b) { b.brain = encodeBrain(b.brain); delete b.px; delete b.py; delete b.k0; });
     copy.hof.forEach(function (h) { h.brain = encodeBrain(h.brain); });
     copy.savedAt = new Date(w.startTime + w.tick * CONFIG.tickMs).toISOString();
     return JSON.stringify(copy);
   }
   function deserialize(text) {
     var w = typeof text === 'string' ? JSON.parse(text) : text; w.config = CONFIG;
-    if (w.version !== VERSION) return w;   // older saves are rejected by the caller; don't touch them
+    if (w.version !== VERSION) return w;
     w.bots.forEach(function (b) { if (typeof b.brain === 'string') b.brain = decodeBrain(b.brain); if (b.px === undefined) { b.px = b.x; b.py = b.y; } });
     w.hof.forEach(function (h) { if (typeof h.brain === 'string') h.brain = decodeBrain(h.brain); });
     return w;
   }
+  function terrain(w) { return rt(w).terrain; }
 
   var api = { VERSION: VERSION, CONFIG: CONFIG, RULES: RULES, TRAITS: TRAITS, TRAIT_RULES: TRAIT_RULES, DEFAULT_TRAITS: DEFAULT_TRAITS,
-              INPUTS: INPUTS, OUTPUTS: OUTPUTS, NH: NH, NW: NW,
-              createWorld: createWorld, step: step, advanceTo: advanceTo, tickAt: tickAt, serialize: serialize, deserialize: deserialize,
-              Stats: Stats, seasonInfo: seasonInfo, maxEnergy: maxEnergy, radius: radius, drain: drain, tanh: tanh,
-              formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS };
+              INPUTS: INPUTS, OUTPUTS: OUTPUTS, NH: NH, NW: NW, createWorld: createWorld, step: step, advanceTo: advanceTo, tickAt: tickAt,
+              serialize: serialize, deserialize: deserialize, Stats: Stats, seasonInfo: seasonInfo, maxEnergy: maxEnergy, radius: radius,
+              terrain: terrain, tileAt: tileAt, temperature: temperature, tanh: tanh, formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS };
   Stats.bind(api);
   return api;
 });

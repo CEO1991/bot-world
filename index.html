@@ -49,7 +49,7 @@
 <header><h1>Bot World</h1><button id="toggle">📊 Stats</button></header>
 <div id="world">
   <canvas id="w" width="1000" height="625"></canvas>
-  <div id="hud"><span>Season: <b id="season">–</b></span><span>Age: <b id="age">–</b></span><span>Era: <b id="era">–</b></span><span>Bots: <b id="alive">–</b></span><span>Grass: <b id="grass">–</b></span><span id="status">Loading world…</span></div>
+  <div id="hud"><span>Season: <b id="season">–</b></span><span>Age: <b id="age">–</b></span><span>Era: <b id="era">–</b></span><span>Bots: <b id="alive">–</b></span><span>Grass: <b id="grass">–</b></span><span>Temp: <b id="temp">–</b></span><span id="status">Loading world…</span></div>
   <div id="bots"></div>
   <div id="events" class="events"></div>
 </div>
@@ -57,6 +57,9 @@
   <h2 style="margin-top:4px">Emergent behaviour (measured from what bots do)</h2>
   <div class="grid" id="patterns"></div>
   <div class="charts2" id="pattern-charts"></div>
+  <h2>Food economy (carrying, caching, sharing)</h2><div class="grid" id="food-cards"></div>
+  <h2>Food lying on the ground (green = growing grass, gold = dropped)</h2><canvas class="chart" id="c-dropped"></canvas>
+  <h2>Home range (typical distance a bot roams from its average spot, px)</h2><canvas class="chart" id="c-home"></canvas>
   <h2>Day by day</h2><div class="tw"><table id="t-days"></table></div>
   <h2>Lineages (behaviour per line)</h2><div class="tw"><table id="t-lin"></table></div>
   <h2>Overview</h2><div class="grid" id="cards"></div>
@@ -74,8 +77,8 @@
   <h2>Event log</h2><div id="s-events" class="events"></div>
 </div>
 </div>
-<script src="stats.js?v=6"></script>
-<script src="sim.js?v=6"></script>
+<script src="stats.js?v=7"></script>
+<script src="sim.js?v=7"></script>
 <script>
 (function(){
 const C = BotSim.CONFIG, ST = BotSim.Stats, cv = document.getElementById('w'), g = cv.getContext('2d');
@@ -83,7 +86,6 @@ const $ = id => document.getElementById(id), fmt = BotSim.formatDuration;
 let world = null, lastHud = 0, lastStats = 0, lastSave = 0;
 const LS_KEY = 'botworld-v' + BotSim.VERSION;
 const TRAITS = BotSim.TRAITS, METRICS = ST.METRICS, PATTERNS = ST.PATTERNS;
-const SEASON_BG = ['#1f3329', '#2b3322', '#33291f', '#232c3a'];
 const SEASON_BAND = ['rgba(120,220,140,.10)', 'rgba(255,220,90,.10)', 'rgba(230,140,60,.10)', 'rgba(140,180,255,.13)'];
 const SEASON_COL = ['#8d8', '#fd6', '#e96', '#9cf'];
 const TRAIT_INFO = { speed: ['Max speed', 'px/tick', 1], vision: ['Vision', 'px', 0], size: ['Size', 'px radius', 1] };
@@ -92,11 +94,21 @@ const MET = {
   follow: ['Following', 'Heading matches the nearest bot. 0 = random, 1 = always same way', '#ffd166', 2],
   herd:   ['Herding', 'How much closer bots are than random (1 = random, >1 = clustered)', '#7fdbca', 2],
   sprint: ['Sprinting', 'Speed when food is visible minus speed otherwise (0 = no strategy)', '#c792ea', 2],
-  call:   ['Food call', 'How much the signal changes when food is seen (0 = meaningless)', '#6cf', 2],
+  call:   ['Food call', 'Biggest change of either signal channel when food is seen (0 = meaningless; random brains already ~0.3-0.5)', '#6cf', 2],
+  warn:   ['Distress signal', 'Biggest change of either signal channel when hungry or cold (0 = meaningless)', '#82aaff', 2],
+  huddle: ['Huddling', 'With no food in sight: heading toward the nearest bot, winter minus summer (0 = no seasonal huddling)', '#ffcb6b', 2],
+  cluster:['Winter clustering', 'Winter/summer ratio of time warmed by a close bot, vs random placement (info only: scarce winter food also gathers bots)', '#f5a97f', 2],
+  settle: ['Settlement', 'Time on riverbanks vs share of land that is riverbank (1 = random)', '#4fc1ff', 2],
+  paths:  ['Paths', 'Share of travel in the busiest 10% of the map (about 0.2 when spread out)', '#d4bfff', 2],
+  cache:  ['Caching', 'Share of meals that were food the bot dropped itself earlier', '#a5e075', 3],
+  share:  ['Sharing', 'Share of meals that were food another bot dropped', '#ff9cac', 3],
+  store:  ['Winter stores', 'Share of winter meals stored before winter began', '#b3e5fc', 3],
   breed:  ['Seasonal breeding', 'Breeding rate in spring+summer vs autumn+winter (1 = no timing)', '#f78c6c', 1]
 };
 const color = (b, l) => `hsl(${b.hue},75%,${l || 62}%)`;
 const sigColor = v => `hsl(${Math.round(150 + v * 150)},90%,60%)`;
+const sig2Color = v => `hsl(${Math.round(30 + v * 60)},95%,${Math.round(55 + v * 10)}%)`;
+const spd = b => Math.sqrt(b.vx * b.vx + b.vy * b.vy) / b.traits.speed;
 const tlabel = (k, v) => v === null || v === undefined ? '–' : v.toFixed(TRAIT_INFO[k][2]);
 const f2 = (v, d) => v === null || v === undefined ? '–' : v.toFixed(d === undefined ? 2 : d);
 
@@ -139,8 +151,37 @@ function catchUp(done){
   })();
 }
 
+// ---- terrain: drawn once per world into an offscreen canvas, then blitted each frame ----
+let terrainCache = null;
+function terrainCanvas(){
+  const key = world.seed + ':' + cv.width;
+  if (terrainCache && terrainCache.key === key) return terrainCache.c;
+  const T = BotSim.terrain(world), c = document.createElement('canvas'); c.width = cv.width; c.height = cv.height;
+  const x = c.getContext('2d'), s = cv.width / C.width, ts = C.tile * s;
+  for (let ty = 0; ty < T.TH; ty++) for (let tx = 0; tx < T.TW; tx++) {
+    const k = ty * T.TW + tx, e = T.elev[k];
+    let col;
+    if (T.water[k]) col = `hsl(205,60%,${30 + e * 40}%)`;
+    else if (e > 0.62) col = `hsl(${32 - (e - 0.62) * 30},${28 - (e - 0.62) * 40}%,${30 + (e - 0.62) * 70}%)`;
+    else { const f = T.fert[k]; col = `hsl(${95 + f * 25},${30 + f * 35}%,${18 + e * 14 + f * 8}%)`; }
+    x.fillStyle = col; x.fillRect(Math.floor(tx * ts), Math.floor(ty * ts), Math.ceil(ts) + 1, Math.ceil(ts) + 1);
+  }
+  // soft contour hints on hills
+  x.strokeStyle = 'rgba(0,0,0,.18)'; x.lineWidth = Math.max(1, s);
+  for (let ty = 0; ty < T.TH; ty++) for (let tx = 0; tx < T.TW - 1; tx++) {
+    const k = ty * T.TW + tx, a = Math.floor(T.elev[k] * 6), b = Math.floor(T.elev[k + 1] * 6);
+    if (a !== b && !T.water[k] && !T.water[k + 1]) { x.beginPath(); x.moveTo((tx + 1) * ts, ty * ts); x.lineTo((tx + 1) * ts, (ty + 1) * ts); x.stroke(); }
+  }
+  terrainCache = { key: key, c: c };
+  return c;
+}
 function drawGrass(gr, s){
   const r = C.grassRadius * 1.3 * s, x = gr.x * s, y = gr.y * s, age = Math.min(1, (world.tick - gr.born) / 30);
+  if (gr.drop) {   // dropped / cached food: a little bundle
+    g.fillStyle = gr.corpse ? '#8a6d3b' : '#c9a227'; g.beginPath(); g.arc(x, y, r * 0.55, 0, 7); g.fill();
+    g.strokeStyle = '#6fd36f'; g.lineWidth = Math.max(1, 1.4 * s); g.beginPath(); g.moveTo(x - r * 0.4, y); g.lineTo(x + r * 0.4, y - r * 0.3); g.stroke();
+    return;
+  }
   g.fillStyle = '#2f7a2f'; g.beginPath(); g.arc(x, y + r*0.3, r * 0.9 * age, 0, 7); g.fill();
   g.strokeStyle = '#6fd36f'; g.lineWidth = Math.max(1, 1.6 * s); g.lineCap = 'round';
   for (let k = 0; k < 5; k++) {
@@ -153,20 +194,28 @@ function drawBot(b, f, s, detail){
   const x = (b.px + (b.x - b.px) * f) * s, y = (b.py + (b.y - b.py) * f) * s, E = b.energy / BotSim.maxEnergy(b);
   if (detail) { g.strokeStyle = 'rgba(255,255,255,0.06)'; g.lineWidth = s; g.beginPath(); g.arc(x, y, b.traits.vision * s, 0, 7); g.stroke(); }
   const grow = Math.min(1, 0.3 + (world.tick - b.born) / 30);
-  // speed whisker: length shows how fast the brain chose to go
-  g.strokeStyle = 'rgba(255,255,255,0.5)'; g.lineWidth = 1.5 * d0; g.beginPath(); g.moveTo(x, y);
-  g.lineTo(x + b.hx * (R + b.speed * 4 * s * 1.5), y + b.hy * (R + b.speed * 4 * s * 1.5)); g.stroke();
+  if (b.warm > 0) { g.fillStyle = `rgba(255,170,80,${0.12 * b.warm})`; g.beginPath(); g.arc(x, y, R * 2.2, 0, 7); g.fill(); }   // shared body warmth
+  // whisker: heading, length = thrust the brain chose
+  const L = R + Math.max(0, b.th) * 14 * s;
+  g.strokeStyle = 'rgba(255,255,255,0.5)'; g.lineWidth = 1.5 * d0; g.beginPath(); g.moveTo(x, y); g.lineTo(x + b.hx * L, y + b.hy * L); g.stroke();
   g.globalAlpha = 0.45 + 0.55 * Math.min(1, E / 0.3);
   g.fillStyle = color(b); g.beginPath(); g.arc(x, y, R * grow, 0, 7); g.fill();
-  g.strokeStyle = sigColor(b.sig); g.lineWidth = Math.max(1.5, 2 * s); g.beginPath(); g.arc(x, y, R * grow + 1.5 * d0, 0, 7); g.stroke(); // signal ring
+  g.lineWidth = Math.max(1.5, 2 * s);
+  g.strokeStyle = sigColor(b.s1); g.beginPath(); g.arc(x, y, R * grow + 1.5 * d0, 0, 7); g.stroke();            // signal channel 1
+  if (Math.abs(b.s2) > 0.3) { g.strokeStyle = sig2Color(b.s2); g.setLineDash([3 * d0, 3 * d0]); g.beginPath(); g.arc(x, y, R * grow + 4.5 * d0, 0, 7); g.stroke(); g.setLineDash([]); } // channel 2
   g.fillStyle = '#fff';
   for (const o of [-1, 1]) { g.beginPath(); g.arc(x + (b.hx*0.4 - b.hy*0.33*o)*R*grow, y + (b.hy*0.4 + b.hx*0.33*o)*R*grow, R*0.22*grow, 0, 7); g.fill(); }
   g.globalAlpha = 1;
+  for (let c = 0; c < b.carry.length; c++) {   // carried food rides on its back
+    g.fillStyle = '#c9a227'; g.beginPath(); g.arc(x - b.hx * R * 0.55 + (c - 0.5 * (b.carry.length - 1)) * R * 0.5 * -b.hy, y - b.hy * R * 0.55 + (c - 0.5 * (b.carry.length - 1)) * R * 0.5 * b.hx, R * 0.24, 0, 7); g.fill();
+  }
 }
+const SEASON_TINT = ['rgba(0,0,0,0)', 'rgba(255,220,120,.06)', 'rgba(200,120,40,.10)', 'rgba(220,235,255,.28)'];
 function drawWorld(f){
   const s = cv.width / C.width, si = BotSim.seasonInfo(world);
-  g.fillStyle = SEASON_BG[si.index]; g.fillRect(0, 0, cv.width, cv.height);
-  if (si.index === 3) { g.fillStyle = 'rgba(255,255,255,0.35)';
+  g.drawImage(terrainCanvas(), 0, 0);
+  g.fillStyle = SEASON_TINT[si.index]; g.fillRect(0, 0, cv.width, cv.height);
+  if (si.index === 3) { g.fillStyle = 'rgba(255,255,255,0.5)';
     for (let i = 0; i < 40; i++) { const sx = ((i * 97 + world.tick * (0.3 + i % 3 * 0.1)) % C.width) * s, sy = ((i * 61 + world.tick * (0.8 + i % 4 * 0.2)) % C.height) * s;
       g.beginPath(); g.arc(sx, sy, 1.6 * s, 0, 7); g.fill(); } }
   world.grass.forEach(gr => drawGrass(gr, s));
@@ -180,15 +229,16 @@ function hud(){
   const si = BotSim.seasonInfo(world);
   $('season').innerHTML = `<span style="color:${SEASON_COL[si.index]}">${si.name}</span> <span style="font-weight:400;color:#9ab">(${fmt((si.endsAt - world.tick) * C.tickMs)} left)</span>`;
   $('age').textContent = fmt(world.tick * C.tickMs); $('era').textContent = world.stats.era;
-  $('alive').textContent = world.bots.length + ' / ' + C.maxPop; $('grass').textContent = world.grass.length + ' / ' + si.cap;
+  $('alive').textContent = world.bots.length + ' / ' + C.maxPop; $('grass').textContent = world.natural + ' / ' + si.cap + (world.dropped ? ' +' + world.dropped + ' dropped' : '');
+  $('temp').textContent = ['mild', 'warm', 'cool', 'cold'][si.index] + (si.index === 3 && si.strength < 0.85 ? ' (harsh)' : '');
   const list = world.bots.slice().sort((a, b) => b.energy / BotSim.maxEnergy(b) - a.energy / BotSim.maxEnergy(a)), show = list.slice(0, 6);
   $('bots').innerHTML = show.map(b => {
     const p = Math.max(0, b.energy / BotSim.maxEnergy(b) * 100), col = p > 50 ? '#5c5' : p > 20 ? '#fc3' : '#f44';
-    return `<div class="bot"><span class="dot" style="background:${color(b)};box-shadow:0 0 0 2px ${sigColor(b.sig)}"></span><span style="width:92px">${name(b)}</span>` +
+    return `<div class="bot"><span class="dot" style="background:${color(b)};box-shadow:0 0 0 2px ${sigColor(b.s1)}"></span><span style="width:92px">${name(b)}</span>` +
       `<span class="bar"><span class="fill" style="width:${p.toFixed(1)}%;background:${col}"></span></span><span style="width:34px">${Math.ceil(p)}%</span>` +
-      `<span style="color:#9ab">speed ${Math.round(100 * b.speed / b.traits.speed)}%</span></div>`;
+      `<span style="color:#9ab">${b.warm > 0 ? '🔥' : ''}${b.carry.length ? ' 🌾' + b.carry.length : ''} ${Math.round(100 * spd(b))}%</span></div>`;
   }).join('') + (list.length > show.length ? `<div class="bot" style="color:#9ab">+ ${list.length - show.length} more (see Stats)</div>` : '') +
-    (list.length ? '<div class="bot" style="color:#789;font-size:11px">Ring colour = the bot\'s signal output; whisker = chosen speed.</div>' : `<div class="bot">Extinct. New life sprouts in a few seconds…</div>`);
+    (list.length ? '<div class="bot" style="color:#789;font-size:11px">Rings = the two signal channels; whisker = thrust; glow = shared warmth; 🌾 = carried food. Water slows bots, hills cost energy, lush banks grow grass.</div>' : `<div class="bot">Extinct. New life sprouts in a few seconds…</div>`);
   $('events').innerHTML = evHtml(world.stats.events.slice(-5));
 }
 
@@ -214,24 +264,32 @@ function chart(id, ys, color, maxY, live, first, minY, thr){
 
 function statsView(){
   const s = ST.summary(world), st = world.stats, E = s.energy, si = BotSim.seasonInfo(world);
+  const card = (k, v, sub) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div>${sub ? `<div class="s">${sub}</div>` : ''}</div>`;
   // ---- emergent patterns ----
   $('patterns').innerHTML = Object.keys(MET).map(k => {
     const P = PATTERNS[k], ps = s.patterns[k] || {}, v = s.ema[k], m = MET[k];
     const status = ps.active ? 'present now' : ps.first !== undefined && ps.first !== null ? 'emerged at ' + fmt(ps.first * C.tickMs) + ', faded' : 'not yet';
-    return `<div class="pat${ps.active ? ' on' : ''}"><div class="k" style="color:${m[2]}">${m[0]}</div><div class="v">${f2(v, m[3])} <span style="font-size:11px;color:#9ab;font-weight:400">/ ${P.th}</span></div>` +
+    return `<div class="pat${ps.active ? ' on' : ''}"><div class="k" style="color:${m[2]}">${m[0]}</div><div class="v">${f2(v, m[3])} <span style="font-size:11px;color:#9ab;font-weight:400">${P ? '/ ' + P.th : 'info'}</span></div>` +
       `<div class="s">${status}${ps.count > 1 ? ' (' + ps.count + '×)' : ''}</div><div class="s">${m[1]}</div></div>`;
   }).join('');
-  if (!$('c-chase')) $('pattern-charts').innerHTML = METRICS.map(k => `<div><div class="ct">${MET[k][0]} (dashed = threshold)</div><canvas class="chart" id="c-${k}"></canvas></div>`).join('');
-  const base = { chase: [1, 0, -0.2], follow: [1, 0, -0.2], herd: [2, 1, 0.5], sprint: [0.5, 0, -0.2], call: [1, 0, 0] };
-  METRICS.forEach(k => chart('c-' + k, st.series[k], MET[k][2], base[k][0], s.ema[k], base[k][1], base[k][2], PATTERNS[k].th));
-  $('t-days').innerHTML = '<tr><th>Day</th><th>Food chasing</th><th>Following</th><th>Herding</th><th>Food/bot/h</th><th>Avg pop</th><th>Extinctions</th></tr>' +
-    s.daily.map(D => `<tr><td>${D.day + 1}</td><td>${f2(D.chase)}</td><td>${f2(D.follow)}</td><td>${f2(D.herd)}</td><td>${f2(D.food, 1)}</td><td>${f2(D.pop, 1)}</td><td>${D.ext}</td></tr>`).join('');
+  if (!$('c-chase')) $('pattern-charts').innerHTML = METRICS.map(k => `<div><div class="ct">${MET[k][0]}${PATTERNS[k] ? ' (dashed = threshold)' : ''}</div><canvas class="chart" id="c-${k}"></canvas></div>`).join('');
+  const base = { chase: [1, 0, -0.2], follow: [1, 0, -0.2], herd: [2, 1, 0.5], sprint: [0.5, 0, -0.2], call: [1, 0, 0], warn: [1, 0, 0], huddle: [0.5, 0, -0.3],
+    cluster: [2, 1, 0], settle: [2, 1, 0], paths: [0.6, 0.1, 0], cache: [0.15, 0, 0], share: [0.2, 0, 0], store: [0.2, 0, 0], breed: [3, 1, 0] };
+  METRICS.forEach(k => chart('c-' + k, st.series[k], MET[k][2], base[k][0], s.ema[k], base[k][1], base[k][2], PATTERNS[k] ? PATTERNS[k].th : undefined));
+  $('t-days').innerHTML = '<tr><th>Day</th><th>Chasing</th><th>Herding</th><th>Settle</th><th>Cache</th><th>Share</th><th>Food/bot/h</th><th>Avg pop</th><th>Extinct.</th></tr>' +
+    s.daily.map(D => `<tr><td>${D.day + 1}</td><td>${f2(D.chase)}</td><td>${f2(D.herd)}</td><td>${f2(D.settle)}</td><td>${f2(D.cache, 3)}</td><td>${f2(D.share, 3)}</td><td>${f2(D.food, 1)}</td><td>${f2(D.pop, 1)}</td><td>${D.ext}</td></tr>`).join('');
   const lins = Object.keys(st.lineages).map(k => st.lineages[k]).sort((a, b) => b.alive - a.alive || a.born - b.born);
-  $('t-lin').innerHTML = '<tr><th>Line</th><th>Alive</th><th>Age</th><th>Births</th><th>Max gen</th><th>Chase</th><th>Follow</th><th>Sprint</th><th>Call</th></tr>' +
+  $('t-lin').innerHTML = '<tr><th>Line</th><th>Alive</th><th>Age</th><th>Births</th><th>Max gen</th><th>Chase</th><th>Follow</th><th>Sprint</th><th>Call</th><th>Warn</th></tr>' +
     (lins.map(L => `<tr><td>${L.name} #${L.root}</td><td>${L.alive}</td><td>${fmt((world.tick - L.born) * C.tickMs)}</td><td>${L.births}</td><td>${L.maxGen}</td>` +
-      ['chase', 'follow', 'sprint', 'call'].map(m => `<td>${f2(L.m ? L.m[m] : null)}</td>`).join('') + '</tr>').join('') || '<tr><td colspan="9">None</td></tr>');
+      ['chase', 'follow', 'sprint', 'call', 'warn'].map(m => `<td>${f2(L.m ? L.m[m] : null)}</td>`).join('') + '</tr>').join('') || '<tr><td colspan="10">None</td></tr>');
+  const X = s.foodx;
+  $('food-cards').innerHTML = [
+    card('Picked up', X.pickups, 'food items lifted'), card('Dropped', X.drops, X.rotted + ' rotted away'),
+    card('Meals from carried food', X.carriedMeals, 'eaten later, on the move'), card('Cached', X.cached, 'dropped, later eaten by the same bot'),
+    card('Shared', X.shared, X.kinShared + ' with kin (same line)'), card('Winter meals from stores', X.winterFromStore, 'of ' + X.winterEats + ' winter meals'),
+    card('Energy lost to cold', Math.round(E.heat), Math.round(100 * E.heat / Math.max(1, E.spent)) + '% of all spending'), card('Energy spent climbing', Math.round(E.climb), 'net of downhill refunds')
+  ].join('');
   // ---- overview ----
-  const card = (k, v, sub) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div>${sub ? `<div class="s">${sub}</div>` : ''}</div>`;
   const causes = Object.keys(s.deaths.byCause).map(c => c + ': ' + s.deaths.byCause[c]).join(', '), OL = s.oldestLiving, OE = s.oldestEver;
   $('cards').innerHTML = [
     card('World age', fmt(s.ageMs), 'year ' + (si.year + 1) + ', ' + si.name), card('Era', s.era, s.extinctions + ' extinction' + (s.extinctions === 1 ? '' : 's')),
@@ -251,7 +309,9 @@ function statsView(){
   chart('c-alive', st.series.alive, '#6cf', 4, world.bots.length, C.pairSize);
   chart('c-food', st.series.food, '#fc6', 10, lastOf(st.series.food), null);
   chart('c-div', st.series.div, '#c9f', 0.1, lastOf(st.series.div), null);
-  chart('c-grass', st.series.grass, '#6fd36f', 10, world.grass.length, C.startGrass);
+  chart('c-grass', st.series.grass, '#6fd36f', 10, world.natural, C.startGrass);
+  chart('c-dropped', st.series.dropped, '#c9a227', 5, world.dropped, 0);
+  chart('c-home', st.series.home, '#4fc1ff', 100, lastOf(st.series.home), null);
   chart('c-energy', st.series.energy, '#fc6', 100, avgE, 100);
   if (!$('c-speed')) $('trait-charts').innerHTML = TRAITS.map(k => `<div><div class="ct">${TRAIT_INFO[k][0]} (${TRAIT_INFO[k][1]}, default ${tlabel(k, BotSim.DEFAULT_TRAITS[k])})</div><canvas class="chart" id="c-${k}"></canvas></div>`).join('');
   TRAITS.forEach(k => { const d0 = BotSim.DEFAULT_TRAITS[k], r = BotSim.TRAIT_RULES[k];
@@ -267,13 +327,13 @@ function statsView(){
     ((world.hof || []).map(h => `<tr><td>${h.name} g${h.gen} #${h.id}</td><td>${fmt(h.lived * C.tickMs)}</td><td>${h.kids}</td><td>${tlabel('speed', h.traits.speed)}</td><td>${tlabel('vision', h.traits.vision)}</td><td>${tlabel('size', h.traits.size)}</td></tr>`).join('') ||
       '<tr><td colspan="6">Empty until the first bots die</td></tr>');
   const live = world.bots.slice().sort((a, b) => a.born - b.born).slice(0, 30);
-  $('t-live').innerHTML = '<tr><th>Bot</th><th>Age</th><th>Energy</th><th>Speed now</th><th>Signal</th><th>Kids</th><th>Max speed</th><th>Vision</th><th>Size</th></tr>' +
+  $('t-live').innerHTML = '<tr><th>Bot</th><th>Age</th><th>Energy</th><th>Speed now</th><th>Signals</th><th>Carry</th><th>Kids</th><th>Max speed</th><th>Vision</th><th>Size</th></tr>' +
     (live.map(b => `<tr><td><span class="dot" style="background:${color(b)}"></span>${name(b)} #${b.id}</td><td>${fmt((world.tick - b.born) * C.tickMs)}</td>` +
-      `<td>${Math.max(0, Math.round(100 * b.energy / BotSim.maxEnergy(b)))}%</td><td>${Math.round(100 * b.speed / b.traits.speed)}%</td><td style="color:${sigColor(b.sig)}">${b.sig.toFixed(2)}</td><td>${b.kids}</td>` +
-      TRAITS.map(k => `<td>${tlabel(k, b.traits[k])}</td>`).join('') + '</tr>').join('') || '<tr><td colspan="9">None alive</td></tr>');
-  $('t-dead').innerHTML = '<tr><th>Bot</th><th>Era</th><th>Lived</th><th>Cause</th><th>Kids</th><th>Ate</th></tr>' +
-    (st.lifespans.slice(-15).reverse().map(l => `<tr><td>${l.name} g${l.gen} #${l.id}</td><td>${l.era}</td><td>${fmt((l.died - l.born) * C.tickMs)}</td><td>${l.cause}</td><td>${l.kids}</td><td>${l.eaten}</td></tr>`).join('') ||
-      '<tr><td colspan="6">No deaths yet</td></tr>');
+      `<td>${Math.max(0, Math.round(100 * b.energy / BotSim.maxEnergy(b)))}%</td><td>${Math.round(100 * spd(b))}%</td><td><span style="color:${sigColor(b.s1)}">${b.s1.toFixed(2)}</span> <span style="color:${sig2Color(b.s2)}">${b.s2.toFixed(2)}</span></td><td>${b.carry.length}</td><td>${b.kids}</td>` +
+      TRAITS.map(k => `<td>${tlabel(k, b.traits[k])}</td>`).join('') + '</tr>').join('') || '<tr><td colspan="10">None alive</td></tr>');
+  $('t-dead').innerHTML = '<tr><th>Bot</th><th>Era</th><th>Lived</th><th>Cause</th><th>Kids</th><th>Ate</th><th>Cached</th><th>Shared</th></tr>' +
+    (st.lifespans.slice(-15).reverse().map(l => `<tr><td>${l.name} g${l.gen} #${l.id}</td><td>${l.era}</td><td>${fmt((l.died - l.born) * C.tickMs)}</td><td>${l.cause}</td><td>${l.kids}</td><td>${l.eaten}</td><td>${l.cached || 0}</td><td>${l.shared || 0}</td></tr>`).join('') ||
+      '<tr><td colspan="8">No deaths yet</td></tr>');
   $('s-events').innerHTML = evHtml(st.events.slice(-40));
 }
 
