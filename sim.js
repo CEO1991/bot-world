@@ -42,7 +42,7 @@
     mutRate: 0.08, mutSd: 0.25, bigMutChance: 0.04, bigMutSd: 0.6, wMax: 4,
     hallOfFame: 4, resproutDelayTicks: 50, pairSize: 2,
     resproutStrong: false,     // re-sprouts use a big mutation of the hall-of-fame brain
-    resproutRandom: 0,         // this many re-sprouted founders get a fresh random brain instead
+    resproutRandom: 1,         // BASELINE: one re-sprouted founder gets a fresh random brain (stops stale hall-of-fame traps)
     // ---- lifetime learning & heritage (switches exist for control experiments) ----
     learning: false,           // experiments branch: lifetime learning switched off
     inherit: false,            // children receive teach-fraction of the parent's learned deltas
