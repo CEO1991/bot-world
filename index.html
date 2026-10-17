@@ -1,24 +1,123 @@
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bot World</title>
-<style>body{margin:0;background:#111;display:flex;justify-content:center;align-items:center;height:100vh}canvas{max-width:95vw;max-height:90vh;background:#1e2a38;border:4px solid #8aa}</style>
-</head><body><canvas id="w" width="800" height="500"></canvas>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Bot World</title>
+<style>
+  html,body{margin:0;background:#111;color:#dde;font:14px -apple-system,system-ui,sans-serif}
+  #wrap{max-width:900px;margin:0 auto;padding:10px calc(10px + env(safe-area-inset-right)) 20px calc(10px + env(safe-area-inset-left))}
+  h1{font-size:18px;margin:4px 0 8px}
+  canvas{display:block;width:100%;height:auto;aspect-ratio:800/500;background:#1e2a38;border:3px solid #8aa;border-radius:6px;box-sizing:border-box}
+  #hud{display:flex;flex-wrap:wrap;gap:6px 16px;margin:8px 0}
+  #hud b{color:#fff}
+  .bot{display:flex;align-items:center;gap:8px;margin:4px 0}
+  .dot{width:14px;height:14px;border-radius:50%}
+  .bar{flex:1;max-width:260px;height:10px;background:#333;border-radius:5px;overflow:hidden}
+  .fill{height:100%}
+  #events{margin-top:8px;color:#99a;font-size:12px;line-height:1.5}
+  #status{color:#fc6}
+</style></head>
+<body><div id="wrap">
+<h1>Bot World</h1>
+<canvas id="w" width="800" height="500"></canvas>
+<div id="hud"><span>World age: <b id="age">–</b></span><span>Bots alive: <b id="alive">–</b></span><span>Grass: <b id="grass">–</b></span><span id="status">Loading world…</span></div>
+<div id="bots"></div>
+<div id="events"></div>
+</div>
+<script src="sim.js?v=2"></script>
 <script>
-const c=document.getElementById('w'),g=c.getContext('2d');
-const R=18;
-function mk(x,y,color){return{x,y,a:Math.random()*Math.PI*2,s:1.5,color,t:0};}
-const bots=[mk(200,250,'#6cf'),mk(600,250,'#f96')];
-function step(b){
-  if(--b.t<=0){b.a+= (Math.random()-0.5)*2; b.t=30+Math.random()*90;}
-  b.x+=Math.cos(b.a)*b.s; b.y+=Math.sin(b.a)*b.s;
-  if(b.x<R){b.x=R;b.a=Math.PI-b.a} if(b.x>c.width-R){b.x=c.width-R;b.a=Math.PI-b.a}
-  if(b.y<R){b.y=R;b.a=-b.a} if(b.y>c.height-R){b.y=c.height-R;b.a=-b.a}
+(function(){
+const C = BotSim.CONFIG, cv = document.getElementById('w'), g = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+let world = null, lastHud = 0, lastSave = 0;
+
+function sizeCanvas(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 3), w = cv.clientWidth || 800;
+  const pw = Math.round(w * dpr), ph = Math.round(w * dpr * C.height / C.width);
+  if (cv.width !== pw) { cv.width = pw; cv.height = ph; }
 }
-function draw(b){
-  g.fillStyle=b.color;g.beginPath();g.arc(b.x,b.y,R,0,7);g.fill();
-  const ex=Math.cos(b.a)*7,ey=Math.sin(b.a)*7;
-  g.fillStyle='#fff';
-  for(const o of [-1,1]){const px=-Math.sin(b.a)*6*o,py=Math.cos(b.a)*6*o;
-    g.beginPath();g.arc(b.x+ex+px,b.y+ey+py,4,0,7);g.fill();}
+window.addEventListener('resize', sizeCanvas);
+
+async function fetchState(){
+  const bust = '?t=' + Date.now();
+  const urls = ['https://raw.githubusercontent.com/CEO1991/bot-world/main/state.json' + bust, 'state.json' + bust];
+  let best = null;
+  for (const u of urls) {
+    try { const r = await fetch(u, {cache:'no-store'}); if (r.ok) { const s = await r.json(); if (!best || s.tick > best.tick) best = s; } } catch(e) {}
+  }
+  // A copy this phone already computed further ahead is identical (deterministic), so reuse it.
+  try {
+    const local = JSON.parse(localStorage.getItem('botworld') || 'null');
+    if (local && best && local.seed === best.seed && local.startTime === best.startTime && local.tick > best.tick) best = local;
+  } catch(e) {}
+  return best;
 }
-(function loop(){g.clearRect(0,0,c.width,c.height);bots.forEach(b=>{step(b);draw(b)});requestAnimationFrame(loop)})();
-</script></body></html>
+
+function catchUp(done){
+  const target = BotSim.tickAt(world, Date.now()), start = world.tick;
+  (function chunk(){
+    const left = BotSim.advanceTo(world, Date.now(), 50000);
+    if (left > 0) {
+      $('status').textContent = 'Catching up… ' + Math.round(100 * (world.tick - start) / Math.max(1, target - start)) + '%';
+      setTimeout(chunk, 0);
+    } else done();
+  })();
+}
+
+function drawGrass(gr){
+  const s = cv.width / C.width, r = C.grassRadius * 1.3 * s, x = gr.x * s, y = gr.y * s;
+  const age = Math.min(1, (world.tick - gr.born) / 30); // pop-in over 3 s
+  g.fillStyle = '#2f7a2f'; g.beginPath(); g.arc(x, y + r*0.3, r * 0.9 * age, 0, 7); g.fill();
+  g.strokeStyle = '#6fd36f'; g.lineWidth = Math.max(1, 1.6 * s); g.lineCap = 'round';
+  for (let k = 0; k < 5; k++) {
+    const off = (k - 2) * r * 0.35, lean = ((gr.id * 7 + k * 13) % 9 - 4) * r * 0.08;
+    g.beginPath(); g.moveTo(x + off, y + r * 0.6); g.lineTo(x + off + lean, y + r * 0.6 - r * (1.2 + (k % 2) * 0.5) * age); g.stroke();
+  }
+}
+
+function drawBot(b, f){
+  const s = cv.width / C.width, R = C.botRadius * s;
+  const x = (b.px + (b.x - b.px) * f) * s, y = (b.py + (b.y - b.py) * f) * s;
+  const dx = BotSim.DX[b.dir], dy = BotSim.DY[b.dir];
+  g.globalAlpha = 0.45 + 0.55 * Math.min(1, b.energy / (C.maxEnergy * 0.3)); // fades when hungry
+  g.fillStyle = b.color; g.beginPath(); g.arc(x, y, R, 0, 7); g.fill();
+  g.fillStyle = '#fff';
+  for (const o of [-1, 1]) { g.beginPath(); g.arc(x + dx*R*0.4 - dy*R*0.33*o, y + dy*R*0.4 + dx*R*0.33*o, R*0.22, 0, 7); g.fill(); }
+  g.globalAlpha = 1;
+}
+
+function hud(){
+  $('age').textContent = BotSim.formatDuration(world.tick * C.tickMs);
+  $('alive').textContent = world.bots.length;
+  $('grass').textContent = world.grass.length;
+  $('bots').innerHTML = world.bots.map(b => {
+    const p = Math.max(0, b.energy / C.maxEnergy * 100);
+    const col = p > 50 ? '#5c5' : p > 20 ? '#fc3' : '#f44';
+    return `<div class="bot"><span class="dot" style="background:${b.color}"></span><span style="width:60px">${b.name}</span>` +
+           `<span class="bar"><span class="fill" style="display:block;width:${p.toFixed(1)}%;background:${col}"></span></span><span>${Math.ceil(p)}%</span></div>`;
+  }).join('') || '<div class="bot">No bots left. The grass keeps growing.</div>';
+  $('events').innerHTML = world.events.slice(-5).reverse().map(e =>
+    `<div>[${BotSim.formatDuration(e.tick * C.tickMs)}] ${e.text}</div>`).join('');
+}
+
+function frame(){
+  const now = Date.now();
+  BotSim.advanceTo(world, now, 20000);
+  const f = Math.max(0, Math.min(1, (now - world.startTime) / C.tickMs - world.tick));
+  g.clearRect(0, 0, cv.width, cv.height);
+  world.grass.forEach(drawGrass);
+  world.bots.forEach(b => drawBot(b, f));
+  if (now - lastHud > 250) { hud(); lastHud = now; }
+  if (now - lastSave > 30000) { try { localStorage.setItem('botworld', BotSim.serialize(world)); } catch(e) {} lastSave = now; }
+  requestAnimationFrame(frame);
+}
+
+(async function start(){
+  sizeCanvas();
+  const s = await fetchState();
+  if (!s) { $('status').textContent = 'Could not load the world. Pull to refresh.'; return; }
+  world = BotSim.deserialize(s);
+  catchUp(() => { $('status').textContent = ''; hud(); requestAnimationFrame(frame); });
+})();
+})();
+</script>
+</body></html>
