@@ -49,7 +49,14 @@
     deltaUnit: 4000,           // learned deltas are ints: 4000 = 1.0 weight; bounded to +-1.0
     apprenticeTicks: 12000,    // childhood (imitation possible): first 20 sim minutes
     imitateRadius: 120, imitateRate: 0.03, parentRange: 400,
-    landmarkMax: 3, landmarkRange: 400, landmarkDecay: 144000, landmarkRefresh: 30, landmarkMinGap: 80, landmarkCooldown: 6000, landmarkCost: 5
+    landmarkMax: 3, landmarkRange: 400, landmarkDecay: 144000, landmarkRefresh: 30, landmarkMinGap: 80, landmarkCooldown: 6000, landmarkCost: 5,
+    // ---- caves (fixed per world, from the terrain seed) ----
+    caves: true,               // caves exist and can be sensed (control: false)
+    caveBenefit: true,         // shelter works (control: false = caves are just places)
+    caveSense: true,           // bots sense caves (direction, closeness, crowding)
+    caveRadius: 28, caveCapacity: 4, caveRange: 400,
+    caveRest: 0.4,             // resting drain (base + vision) inside a cave is 40% of normal; no cold drain at all
+    caveDecayMul: 8            // food dropped inside a cave rots 8x slower (48 h instead of 6 h)
   };
 
   var TRAITS = ['speed', 'vision', 'size', 'learn', 'teach'];
@@ -61,7 +68,8 @@
                 'crowd', 'seasonSin', 'seasonCos', 'abundance', 'age', 'memory', 'warmth',
                 'onWater', 'elevation', 'fertilityAhead', 'slopeAhead', 'carrying',
                 'signalSide', 'signalAhead', 'signal1', 'signal2', 'speed',
-                'markSide', 'markAhead', 'markNear', 'foreignMark', 'parentSide', 'parentAhead', 'parentNear', 'parentAlive', 'bias'];
+                'markSide', 'markAhead', 'markNear', 'foreignMark', 'parentSide', 'parentAhead', 'parentNear', 'parentAlive',
+                'caveSide', 'caveAhead', 'caveNear', 'inCave', 'caveCrowd', 'bias'];
   var OUTPUTS = ['turn', 'thrust', 'reproduce', 'memory', 'signal1', 'signal2', 'pickUp', 'drop', 'eatCarried', 'mark'];
   var NI = INPUTS.length, NH = 8, NO = OUTPUTS.length;
   var NW = NI * NH + (NH + 1) * NO, ND = (NH + 1) * NO;   // ND = size of the plastic (learned) layer
@@ -86,7 +94,7 @@
   function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
   function tanh(x) { if (x > 3) return 1; if (x < -3) return -1; var x2 = x * x; return x * (27 + x2) / (27 + 9 * x2); }
 
-  var VERSION = 8;
+  var VERSION = 9;
   var H = Stats.hooks;
   var PAIR = [{ name: 'Blue', hue: 195 }, { name: 'Orange', hue: 25 }];
 
@@ -95,7 +103,7 @@
   function rt(w) {
     var r = RT ? RT.get(w) : (RT_FALLBACK && RT_FALLBACK.w === w ? RT_FALLBACK : null);
     if (r) return r;
-    r = { w: w, terrain: terrainFor(w.terrainSeed), food: null, bots: null };
+    r = { w: w, terrain: terrainFor(w.terrainSeed), food: null, bots: null, occ: [0, 0, 0, 0, 0, 0] };
     r.food = foodGridBuild(w);
     if (RT) RT.set(w, r); else RT_FALLBACK = r;
     return r;
@@ -156,9 +164,24 @@
       fert[i] = f; total += f; cum[i] = total;
       if (!water[i]) { landTiles++; if (dist[i] <= 2) { bank[i] = 1; bankTiles++; } }
     }
-    var T = { TW: TW, TH: TH, elev: elev, water: water, fert: fert, cum: cum, total: total, dist: dist, bank: bank, bankFrac: bankTiles / Math.max(1, landTiles) };
+    // caves: 3-5 small shelters, mostly in the hills, some at the edge of the plains (generated after everything else,
+    // so the rest of the terrain is unchanged for a given seed)
+    var caves = [], nc = 3 + Math.floor(r() * 3), hill = [], edge = [];
+    for (i = 0; i < N; i++) { x = i % TW; y = (i - x) / TW;
+      if (water[i] || dist[i] <= 1 || x < 1 || y < 1 || x >= TW - 1 || y >= TH - 1) continue;
+      if (elev[i] >= 0.6) hill.push(i); else if (elev[i] >= 0.45) edge.push(i); }
+    for (var tries = 0; tries < 200 && caves.length < nc; tries++) {
+      var pool = (r() < 0.75 && hill.length) || !edge.length ? hill : edge; if (!pool.length) break;
+      var ti = pool[Math.floor(r() * pool.length)], cxp = (ti % TW + 0.5) * CONFIG.tile, cyp = (Math.floor(ti / TW) + 0.5) * CONFIG.tile, ok = true;
+      for (var q = 0; q < caves.length; q++) { var ddx = caves[q].x - cxp, ddy = caves[q].y - cyp; if (ddx * ddx + ddy * ddy < 160 * 160) ok = false; }
+      if (ok) caves.push({ x: cxp, y: cyp, hill: elev[ti] >= 0.6 ? 1 : 0 });
+    }
+    var T = { TW: TW, TH: TH, elev: elev, water: water, fert: fert, cum: cum, total: total, dist: dist, bank: bank, bankFrac: bankTiles / Math.max(1, landTiles), caves: caves };
     TERRAIN_CACHE[seed] = T; return T;
   }
+  function cavesOf(T) { return CONFIG.caves ? T.caves : NO_CAVES; }
+  var NO_CAVES = [];
+  function caveAt(C, x, y) { var R2 = CONFIG.caveRadius * CONFIG.caveRadius; for (var i = 0; i < C.length; i++) { var dx = C[i].x - x, dy = C[i].y - y; if (dx * dx + dy * dy < R2) return i; } return -1; }
   function tileAt(T, x, y) {
     var tx = Math.floor(x / CONFIG.tile), ty = Math.floor(y / CONFIG.tile);
     if (tx < 0) tx = 0; if (ty < 0) ty = 0; if (tx >= T.TW) tx = T.TW - 1; if (ty >= T.TH) ty = T.TH - 1;
@@ -201,7 +224,9 @@
   }
 
   // ---------------- genomes ----------------
-  function randomBrain(w) { var g = []; for (var i = 0; i < NW; i++) g.push(Math.round((rand(w) - 0.5) * 1000)); return g; }
+  // new random brains start with weak links from the cave senses (newest inputs), so evolution decides whether caves matter
+  var WEAK_IN = { 34: 1, 35: 1, 36: 1, 37: 1, 38: 1 };
+  function randomBrain(w) { var g = []; for (var i = 0; i < NW; i++) { var v = (rand(w) - 0.5) * 1000; if (i < NI * NH && WEAK_IN[i % NI]) v *= 0.1; g.push(Math.round(v)); } return g; }
   function fitBrain(w, g) {   // pads (small random weights) or trims a genome of another size, e.g. from an older layout
     if (g.length === NW) return g;
     var c = g.slice(0, NW); while (c.length < NW) c.push(Math.round((rand(w) - 0.5) * 200)); return c;
@@ -236,7 +261,8 @@
              pick: o.pick, drop: o.drop, eatC: o.eatC, carry: o.carry, warm: o.warm, bx: o.bx, by: o.by, k0: o.k0 === undefined ? -1 : o.k0,
              D: o.D || zeros(ND), ph: o.ph || zeros(NH + 1), po: o.po || zeros(NO), rw: o.rw || 0, rb: o.rb || 0, lastMark: o.lastMark === undefined ? -1e9 : o.lastMark,
              eaten: o.eaten || 0, gained: o.gained || 0, spent: o.spent || 0, era: o.era || 0, hr: o.hr || [0, 0, 0, 0, 0], shared: o.shared || 0, cached: o.cached || 0,
-             e1: o.e1 || 0, e2: o.e2 || 0, inh: o.inh || 0, apN: o.apN || 0, apS: o.apS || 0, y15: o.y15 || 0, imit: o.imit || 0 };
+             e1: o.e1 || 0, e2: o.e2 || 0, inh: o.inh || 0, apN: o.apN || 0, apS: o.apS || 0, y15: o.y15 || 0, imit: o.imit || 0,
+             cv: o.cv === undefined ? -1 : o.cv, sh: o.sh || 0, wt: o.wt || 0, cwt: o.cwt || 0 };
   }
   function zeros(n) { var a = []; for (var i = 0; i < n; i++) a.push(0); return a;
   }
@@ -283,6 +309,7 @@
     while (lo < hi) { var mid = (lo + hi) >> 1; if (T.cum[mid] < target) lo = mid + 1; else hi = mid; }
     var tx = lo % T.TW, ty = Math.floor(lo / T.TW), r = CONFIG.grassRadius;
     var x = clamp((tx + rand(w)) * CONFIG.tile, r, CONFIG.width - r), y = clamp((ty + rand(w)) * CONFIG.tile, r, CONFIG.height - r);
+    if (caveAt(cavesOf(T), x, y) >= 0) return;   // nothing grows inside a cave
     addFood(w, { id: w.nextId++, x: x, y: y, born: w.tick });
     H.grassSpawn(w);
   }
@@ -330,7 +357,7 @@
     IN[12] = w.natural / info.cap;
     IN[13] = Math.min(1, (w.tick - b.born) / 72000);
     IN[14] = b.mem;
-    var temp = temperature(w, T, b); IN[15] = Math.min(1, temp + (1 - temp) * b.warm);
+    var temp = b.sh ? 1 : temperature(w, T, b); IN[15] = Math.min(1, temp + (1 - temp) * b.warm);
     IN[16] = T.water[k0]; IN[17] = T.elev[k0]; IN[18] = T.fert[ahead]; IN[19] = (T.elev[ahead] - T.elev[k0]) * 4;
     IN[20] = b.carry.length / CONFIG.maxCarry;
     if (sb) { var sl = Math.sqrt((sb.x - bx) * (sb.x - bx) + (sb.y - by) * (sb.y - by)) || 1, sx = (sb.x - bx) / sl, sy = (sb.y - by) / sl;
@@ -352,7 +379,14 @@
     if (CONFIG.apprentice && par && parD < CONFIG.parentRange) { var pl = parD || 1, qx = (par.x - bx) / pl, qy = (par.y - by) / pl;
       IN[30] = hx * qy - hy * qx; IN[31] = hx * qx + hy * qy; IN[32] = 1 - parD / CONFIG.parentRange; IN[33] = 1; }
     else { IN[30] = 0; IN[31] = 0; IN[32] = 0; IN[33] = 0; }
-    IN[34] = 1;
+    // caves: nearest one (direction, closeness), inside flag, crowding of the nearest cave
+    var CV = cavesOf(T), cb = -1, cd = Infinity, CR = CONFIG.caveRange;
+    for (i = 0; i < CV.length; i++) { var cxd = CV[i].x - bx, cyd = CV[i].y - by, c2 = cxd * cxd + cyd * cyd; if (c2 < cd) { cd = c2; cb = i; } }
+    if (CONFIG.caveSense && cb >= 0 && cd < CR * CR) { cd = Math.sqrt(cd); var cl = cd || 1, kx = (CV[cb].x - bx) / cl, ky = (CV[cb].y - by) / cl;
+      IN[34] = cd < 1 ? 0 : hx * ky - hy * kx; IN[35] = cd < 1 ? 0 : hx * kx + hy * ky; IN[36] = 1 - cd / CR; IN[38] = rt(w).occ[cb] / CONFIG.caveCapacity; }
+    else { IN[34] = 0; IN[35] = 0; IN[36] = 0; IN[38] = 0; }
+    IN[37] = b.cv >= 0 ? 1 : 0;
+    IN[39] = 1;
     var W = weights(b.brain), k = 0, s;
     var nz = 0; for (i = 0; i < NI; i++) if (IN[i] !== 0) NZ[nz++] = i;   // skip zero inputs (adding 0 changes nothing)
     for (j = 0; j < NH; j++) { s = 0; var base = j * NI; for (i = 0; i < nz; i++) s += IN[NZ[i]] * W[base + NZ[i]]; HID[j] = tanh(s); }
@@ -405,9 +439,10 @@
     if (mine.length >= CONFIG.landmarkMax) { var old = mine[0]; for (i = 1; i < mine.length; i++) if (mine[i].placed < old.placed) old = mine[i]; LM.splice(LM.indexOf(old), 1); }
     var L = { lin: b.lineage, hue: b.hue, by: b.id, x: Math.round(b.x * 10) / 10, y: Math.round(b.y * 10) / 10, placed: w.tick, seen: w.tick };
     LM.push(L); b.lastMark = w.tick; b.energy -= CONFIG.landmarkCost;   // marking costs a little energy
-    H.landmark(w, b, L, T.fert[tileAt(T, L.x, L.y)], T.bank[tileAt(T, L.x, L.y)]);
+    H.landmark(w, b, L, T.fert[tileAt(T, L.x, L.y)], T.bank[tileAt(T, L.x, L.y)], caveNear(cavesOf(T), L.x, L.y));
   }
 
+  function caveNear(C, x, y) { var R = CONFIG.caveRadius + 40; for (var i = 0; i < C.length; i++) { var dx = C[i].x - x, dy = C[i].y - y; if (dx * dx + dy * dy < R * R) return 1; } return 0; }
   function eatItem(w, b, item, how) {
     var before = b.energy, mx = maxEnergy(b);
     b.energy = Math.min(mx, b.energy + CONFIG.grassEnergy);
@@ -436,6 +471,12 @@
       if (w.bots.length > 0 || w.resproutAt === null || w.tick < w.resproutAt) return;
       w.resproutAt = null; H.newEra(w); freshPair(w, 'new life after extinction');
     },
+    function caves(w) {   // who is inside which cave; only the first `caveCapacity` occupants (oldest first) are sheltered
+      var C = cavesOf(rt(w).terrain), occ = rt(w).occ, BS = w.bots, i;
+      for (i = 0; i < occ.length; i++) occ[i] = 0;
+      for (i = 0; i < BS.length; i++) { var b = BS[i], c = C.length ? caveAt(C, b.x, b.y) : -1; b.cv = c; b.sh = 0;
+        if (c >= 0) { occ[c]++; if (CONFIG.caveBenefit && occ[c] <= CONFIG.caveCapacity) b.sh = 1; } }
+    },
     function brains(w) {
       var n = CONFIG.thinkEvery, info = null, T = null;
       for (var i = 0; i < w.bots.length; i++) { var b = w.bots[i]; if ((w.tick + b.id) % n === 0) { if (!info) { info = seasonCached(w); T = rt(w).terrain; } think(w, b, info, T); } }
@@ -449,7 +490,7 @@
         // turning force and thrust (inertia + friction)
         if (b.tu !== 0) { var t = b.tu * TP, nx = hx - hy * t, ny = hy + hx * t, nl = Math.sqrt(nx * nx + ny * ny); hx = nx / nl; hy = ny / nl; }
         var tx = Math.floor(x / TL), ty = Math.floor(y / TL); if (tx >= TW) tx = TW - 1; if (ty >= TH) ty = TH - 1; if (tx < 0) tx = 0; if (ty < 0) ty = 0;
-        var k0 = ty * TW + tx, fr = WAT[k0] ? WFR : FR;
+        var k0 = ty * TW + tx, fr = WAT[k0] || b.cv >= 0 ? WFR : FR;   // water and narrow caves slow movement
         var acc = sp * (1 - FR) * b.th * (1 - CS * b.carry.length);
         var vx = (b.vx + hx * acc) * fr, vy = (b.vy + hy * acc) * fr;
         x += vx; y += vy;
@@ -486,11 +527,11 @@
       var T = rt(w).terrain, si = Math.floor(w.tick / CONFIG.seasonTicks) % 4, cold = (1 - CONFIG.seasonTemp[si]) * (si === 3 ? 1 / w.yearStrength : 1); // harsh years have colder winters
       for (var i = 0; i < w.bots.length; i++) {
         var b = w.bots[i], f = sizeF(b), f2 = f * f, k1 = tileAt(T, b.x, b.y);
-        var cost = CONFIG.drainBase * f2 + CONFIG.drainPerThrust * Math.abs(b.th) * b.traits.speed * f + CONFIG.drainPerVision * b.traits.vision;
+        var cost = (CONFIG.drainBase * f2 + CONFIG.drainPerVision * b.traits.vision) * (b.sh ? CONFIG.caveRest : 1) + CONFIG.drainPerThrust * Math.abs(b.th) * b.traits.speed * f;
         var dh = T.elev[k1] - T.elev[b.k0 < 0 ? k1 : b.k0];
         var climb = dh > 0 ? CONFIG.climbCost * dh * f2 : CONFIG.climbCost * 0.5 * dh * f2;
         var c = cold + (T.water[k1] ? 0.15 : 0); if (c > 1.5) c = 1.5;
-        var heat = CONFIG.coldCost * c * (1 - b.warm) * f2;
+        var heat = b.sh ? 0 : CONFIG.coldCost * c * (1 - b.warm) * f2;
         cost = Math.max(0, cost + climb) + heat;
         var d = Math.min(cost, b.energy); b.energy -= cost; b.rw -= heat + (climb > 0 ? climb : 0); H.spend(w, b, d, heat, climb);
       }
@@ -509,7 +550,7 @@
             var dx = f.x - b.x, dy = f.y - b.y; if (dx * dx + dy * dy >= r2) continue;
             if (f.drop && f.dropper === b.id && w.tick - f.dropTick < CONFIG.ownDropGrace) continue;
             if (b.pick > 0.5 && b.carry.length < CONFIG.maxCarry) {
-              removeFood(w, f); b.carry.push({ id: f.id, born: f.born, picked: w.tick, dropper: f.dropper || null, dropLin: f.dropLin || null, dropTick: f.dropTick || null, corpse: f.corpse || 0 });
+              removeFood(w, f); b.carry.push({ id: f.id, born: f.born, picked: w.tick, dropper: f.dropper || null, dropLin: f.dropLin || null, dropTick: f.dropTick || null, corpse: f.corpse || 0, cave: f.cave || 0 });
               H.pickup(w, b, f);
             } else if (b.energy < mx - 1) { removeFood(w, f); eatItem(w, b, f, f.drop ? 'ground-drop' : 'ground'); }
           }
@@ -520,7 +561,9 @@
         if (b.drop > 0.5 && b.carry.length && w.dropped < CONFIG.maxDropped && (w.tick + b.id) % CONFIG.thinkEvery === 0) {
           var c2 = b.carry.shift();
           var fx = clamp(b.x - b.hx * (radius(b) + gr + 2), gr, CONFIG.width - gr), fy = clamp(b.y - b.hy * (radius(b) + gr + 2), gr, CONFIG.height - gr);
-          var dropped = { id: c2.id, x: fx, y: fy, born: c2.born, drop: 1, dropper: b.id, dropLin: b.lineage, dropTick: w.tick, rotAt: w.tick + CONFIG.dropDecayTicks, picked: c2.picked };
+          var inC = caveAt(cavesOf(rt(w).terrain), fx, fy);   // food left inside a cave keeps much longer
+          var dropped = { id: c2.id, x: fx, y: fy, born: c2.born, drop: 1, dropper: b.id, dropLin: b.lineage, dropTick: w.tick,
+                          rotAt: w.tick + CONFIG.dropDecayTicks * (inC >= 0 ? CONFIG.caveDecayMul : 1), picked: c2.picked, cave: inC >= 0 ? inC + 1 : 0 };
           addFood(w, dropped); H.dropped(w, b, dropped);
         }
       }
@@ -628,7 +671,7 @@
   var api = { VERSION: VERSION, CONFIG: CONFIG, RULES: RULES, TRAITS: TRAITS, TRAIT_RULES: TRAIT_RULES, DEFAULT_TRAITS: DEFAULT_TRAITS,
               INPUTS: INPUTS, OUTPUTS: OUTPUTS, NH: NH, NW: NW, ND: ND, createWorld: createWorld, step: step, advanceTo: advanceTo, advanceToTick: advanceToTick, tickAt: tickAt, tickAtF: tickAtF, timeOfTick: timeOfTick, clockRate: clockRate, setClockRate: setClockRate, addJump: addJump,
               serialize: serialize, deserialize: deserialize, Stats: Stats, seasonInfo: seasonInfo, maxEnergy: maxEnergy, radius: radius,
-              terrain: terrain, tileAt: tileAt, temperature: temperature, tanh: tanh, formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS };
+              terrain: terrain, tileAt: tileAt, cavesOf: cavesOf, caveOcc: function (w) { return rt(w).occ; }, temperature: temperature, tanh: tanh, formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS };
   Stats.bind(api);
   return api;
 });

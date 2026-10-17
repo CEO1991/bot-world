@@ -70,6 +70,10 @@
   <div class="s" style="font-size:12px;color:#9ab;margin-bottom:6px">Each bot has genes plus a small learned layer that changes with food rewards during its life. Children get a share of their parent's learned layer (teaching), can copy their parent while young (apprenticeship), and families can mark landmarks.</div>
   <div class="grid" id="her-cards"></div>
   <div class="charts2" id="her-charts"></div>
+  <h2>Caves</h2>
+  <div class="s" style="font-size:12px;color:#9ab;margin-bottom:6px">Small caves (mostly in the hills) hold about 4 bots each. Inside: no cold, resting costs less, nothing grows, and food left there keeps much longer. Bots are not told any of this; they have to find out.</div>
+  <div class="grid" id="cave-cards"></div>
+  <div class="charts2" id="cave-charts"></div>
   <h2>Food economy (carrying, caching, sharing)</h2><div class="grid" id="food-cards"></div>
   <h2>Food lying on the ground (green = growing grass, gold = dropped)</h2><canvas class="chart" id="c-dropped"></canvas>
   <h2>Home range (typical distance a bot roams from its average spot, px)</h2><canvas class="chart" id="c-home"></canvas>
@@ -90,8 +94,8 @@
   <h2>Event log</h2><div id="s-events" class="events"></div>
 </div>
 </div>
-<script src="stats.js?v=9"></script>
-<script src="sim.js?v=9"></script>
+<script src="stats.js?v=10"></script>
+<script src="sim.js?v=10"></script>
 <script>
 (function(){
 const C = BotSim.CONFIG, ST = BotSim.Stats, cv = document.getElementById('w'), g = cv.getContext('2d');
@@ -119,6 +123,9 @@ const MET = {
   learn:  ['Lifetime learning', 'Meals in an adult\'s 2nd 20 min minus its 1st 20 min (eating less when full makes this negative by default)', '#ffcb6b', 2],
   care:   ['Parental care', 'Children (3-20 min old) near their own parent vs near a random other adult (1 = no preference)', '#ff9cac', 2],
   homing: ['Homing', 'Time near own family landmarks (30+ min old) vs random wandering (1 = no attraction)', '#c3e88d', 2],
+  shelter:   ['Winter sheltering', 'Share of bots inside caves in winter vs in summer (or vs the caves\' share of the map); 1 = no seasonal use', '#9cf', 1],
+  cavestore: ['Cave food storage', 'Share of meals that were food left inside a cave', '#c9a227', 3],
+  territory: ['Cave territory', 'How much one family holds a cave beyond its share of the population (1 = no ownership)', '#f78c6c', 1],
   breed:  ['Seasonal breeding', 'Breeding rate in spring+summer vs autumn+winter (1 = no timing)', '#f78c6c', 1]
 };
 const color = (b, l) => `hsl(${b.hue},75%,${l || 62}%)`;
@@ -175,7 +182,7 @@ function catchUp(done){
   const behind = BotSim.tickAt(world, Date.now()) - world.tick;
   if (behind < 3000 || typeof Worker === 'undefined') { catchUpMain(finish); return; }
   let wk;
-  try { wk = new Worker('worker.js?v=9'); } catch (e) { catchUpMain(finish); return; }
+  try { wk = new Worker('worker.js?v=10'); } catch (e) { catchUpMain(finish); return; }
   $('status').textContent = 'Catching up… 0%';
   wk.onmessage = ev => {
     const m = ev.data;
@@ -250,6 +257,15 @@ function terrainCanvas(){
     const k = ty * T.TW + tx, a = Math.floor(T.elev[k] * 6), b = Math.floor(T.elev[k + 1] * 6);
     if (a !== b && !T.water[k] && !T.water[k + 1]) { x.beginPath(); x.moveTo((tx + 1) * ts, ty * ts); x.lineTo((tx + 1) * ts, (ty + 1) * ts); x.stroke(); }
   }
+  // caves: dark rocky openings
+  BotSim.cavesOf(T).forEach((cvv, i) => {
+    const cx = cvv.x * s, cy = cvv.y * s, R = C.caveRadius * s;
+    for (let k = 0; k < 9; k++) { const a = k * 0.7 + i, rr = R * (1.05 + (k % 3) * 0.12);   // rocks around the mouth
+      x.fillStyle = k % 2 ? '#5d554c' : '#4a443d'; x.beginPath(); x.arc(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr * 0.8, R * 0.28, 0, 7); x.fill(); }
+    const gr = x.createRadialGradient(cx, cy, R * 0.1, cx, cy, R);
+    gr.addColorStop(0, '#050505'); gr.addColorStop(0.75, '#16130f'); gr.addColorStop(1, 'rgba(30,26,22,0.9)');
+    x.fillStyle = gr; x.beginPath(); x.ellipse(cx, cy, R, R * 0.82, 0, 0, 7); x.fill();
+  });
   terrainCache = { key: key, c: c };
   return c;
 }
@@ -288,6 +304,16 @@ function drawBot(b, f, s, detail){
     g.fillStyle = '#c9a227'; g.beginPath(); g.arc(x - b.hx * R * 0.55 + (c - 0.5 * (b.carry.length - 1)) * R * 0.5 * -b.hy, y - b.hy * R * 0.55 + (c - 0.5 * (b.carry.length - 1)) * R * 0.5 * b.hx, R * 0.24, 0, 7); g.fill();
   }
 }
+function drawCaveOcc(s){   // occupancy pips above each cave: filled = sheltered, red = over capacity
+  const d0 = Math.min(window.devicePixelRatio || 1, 3), occ = BotSim.caveOcc(world);
+  BotSim.cavesOf(BotSim.terrain(world)).forEach((cvv, i) => {
+    const n = occ[i] || 0, x = cvv.x * s, y = (cvv.y - C.caveRadius - 8) * s;
+    for (let k = 0; k < Math.max(C.caveCapacity, n); k++) {
+      g.fillStyle = k < n ? (k < C.caveCapacity ? '#ffd166' : '#ff6b6b') : 'rgba(255,255,255,.25)';
+      g.beginPath(); g.arc(x + (k - (Math.max(C.caveCapacity, n) - 1) / 2) * 6 * d0, y, 2.2 * d0, 0, 7); g.fill();
+    }
+  });
+}
 function drawLandmarks(s){   // family landmarks: little flags in the family colour, fading when neglected
   const d0 = Math.min(window.devicePixelRatio || 1, 3);
   (world.landmarks || []).forEach(L => {
@@ -311,6 +337,7 @@ function drawWorld(f){
   world.grass.forEach(gr => drawGrass(gr, s));
   const detail = world.bots.length <= 4;
   world.bots.forEach(b => drawBot(b, f, s, detail));
+  drawCaveOcc(s);
 }
 
 const evHtml = list => list.slice().reverse().map(e => `<div class="${e.type}">[${fmt(e.tick * C.tickMs)}] ${e.text}</div>`).join('');
@@ -329,7 +356,7 @@ function hud(){
       `<span class="bar"><span class="fill" style="width:${p.toFixed(1)}%;background:${col}"></span></span><span style="width:34px">${Math.ceil(p)}%</span>` +
       `<span style="color:#9ab">${b.warm > 0 ? '🔥' : ''}${b.carry.length ? ' 🌾' + b.carry.length : ''} ${Math.round(100 * spd(b))}%</span></div>`;
   }).join('') + (list.length > show.length ? `<div class="bot" style="color:#9ab">+ ${list.length - show.length} more (see Stats)</div>` : '') +
-    (list.length ? '<div class="bot" style="color:#789;font-size:11px">Rings = the two signal channels; whisker = thrust; glow = shared warmth; 🌾 = carried food. Water slows bots, hills cost energy, lush banks grow grass.</div>' : `<div class="bot">Extinct. New life sprouts in a few seconds…</div>`);
+    (list.length ? '<div class="bot" style="color:#789;font-size:11px">Rings = the two signal channels; whisker = thrust; glow = shared warmth; 🌾 = carried food. Water slows bots, hills cost energy, lush banks grow grass. Dark holes = caves (dots = bots inside).</div>' : `<div class="bot">Extinct. New life sprouts in a few seconds…</div>`);
   $('events').innerHTML = evHtml(world.stats.events.slice(-5));
 }
 
@@ -365,7 +392,7 @@ function statsView(){
   }).join('');
   if (!$('c-chase')) $('pattern-charts').innerHTML = METRICS.map(k => `<div><div class="ct">${MET[k][0]}${PATTERNS[k] ? ' (dashed = threshold)' : ''}</div><canvas class="chart" id="c-${k}"></canvas></div>`).join('');
   const base = { chase: [1, 0, -0.2], follow: [1, 0, -0.2], herd: [2, 1, 0.5], sprint: [0.5, 0, -0.2], call: [1, 0, 0], warn: [1, 0, 0], huddle: [0.5, 0, -0.3],
-    cluster: [2, 1, 0], settle: [2, 1, 0], paths: [0.6, 0.1, 0], cache: [0.15, 0, 0], share: [0.2, 0, 0], store: [0.2, 0, 0], breed: [3, 1, 0], learn: [2, 0, -3], care: [3, 1, 0], homing: [3, 1, 0] };
+    cluster: [2, 1, 0], settle: [2, 1, 0], paths: [0.6, 0.1, 0], cache: [0.15, 0, 0], share: [0.2, 0, 0], store: [0.2, 0, 0], breed: [3, 1, 0], learn: [2, 0, -3], care: [3, 1, 0], homing: [3, 1, 0], shelter: [3, 1, 0], cavestore: [0.05, 0, 0], territory: [3, 1, 0] };
   METRICS.forEach(k => chart('c-' + k, st.series[k], MET[k][2], base[k][0], s.ema[k], base[k][1], base[k][2], PATTERNS[k] ? PATTERNS[k].th : undefined));
   $('t-days').innerHTML = '<tr><th>Day</th><th>Chasing</th><th>Herding</th><th>Settle</th><th>Cache</th><th>Share</th><th>Food/bot/h</th><th>Avg pop</th><th>Extinct.</th></tr>' +
     s.daily.map(D => `<tr><td>${D.day + 1}</td><td>${f2(D.chase)}</td><td>${f2(D.herd)}</td><td>${f2(D.settle)}</td><td>${f2(D.cache, 3)}</td><td>${f2(D.share, 3)}</td><td>${f2(D.food, 1)}</td><td>${f2(D.pop, 1)}</td><td>${D.ext}</td></tr>`).join('');
@@ -394,6 +421,24 @@ function statsView(){
   if (!$('c-dmag')) $('her-charts').innerHTML = [['dmag', 'Learned change (avg |delta|)'], ['lm', 'Landmarks in the world']].map(a => `<div><div class="ct">${a[1]}</div><canvas class="chart" id="c-${a[0]}"></canvas></div>`).join('');
   chart('c-dmag', st.series.dmag, '#ffcb6b', 0.05, dmagNow, 0);
   chart('c-lm', st.series.lm, '#c3e88d', 3, (world.landmarks || []).length, 0);
+  // ---- caves ----
+  const V = s.cv, CVs = BotSim.cavesOf(BotSim.terrain(world)), occN = BotSim.caveOcc(world);
+  const shareS = i => V.botT[i] ? Math.round(1000 * V.inT[i] / V.botT[i]) / 10 + '%' : '–';
+  const owners = CVs.map((c, i) => { const O = V.own[i] || {}; let top = null, tot = 0; for (const k in O) { tot += O[k]; if (top === null || O[k] > O[top]) top = k; }
+    const L = top !== null ? st.lineages[top] : null; return tot >= 5 ? (L ? L.name + ' #' + top : 'line #' + top + ' (gone)') + ' ' + Math.round(100 * O[top] / tot) + '%' : 'nobody yet'; });
+  const WS = V.wS;
+  $('cave-cards').innerHTML = [
+    card('Caves', CVs.length, CVs.filter(c => c.hill).length + ' in hills; ' + C.caveCapacity + ' bots fit in each'),
+    card('In caves now', occN.slice(0, CVs.length).reduce((a, b) => a + b, 0), 'bots inside a cave right now'),
+    card('Winter time in caves', shareS(3), 'of all bot time in winter (summer ' + shareS(1) + ', spring ' + shareS(0) + ', autumn ' + shareS(2) + ')'),
+    card('Winter survival', pct(WS.cS, WS.cS + WS.cD) + ' / ' + pct(WS.nS, WS.nS + WS.nD), 'bots that used caves (20%+ of winter) vs not (' + (WS.cS + WS.cD) + ' / ' + (WS.nS + WS.nD) + ' bots)'),
+    card('Food left in caves', V.drops.reduce((a, b) => a + b, 0), 'by season Sp/Su/Au/Wi: ' + V.drops.join(' / ')),
+    card('Meals from cave stores', V.meals.reduce((a, b) => a + b, 0), 'by season Sp/Su/Au/Wi: ' + V.meals.join(' / ')),
+    card('Who holds each cave', (n => n + (n === 1 ? ' family' : ' families'))(new Set(owners.filter(o => o !== 'nobody yet').map(o => o.replace(/ \d+%$/, ''))).size), owners.map((o, i) => 'cave ' + (i + 1) + ': ' + o).join('<br>')),
+    card('Sharing vs keeping', pct(V.mixed, V.mixed + V.solo), 'of occupied-cave checks with 2+ families inside; ' + V.flags + ' family flags placed at caves')
+  ].join('');
+  if (!$('c-cave')) $('cave-charts').innerHTML = `<div><div class="ct">Bots inside caves (season bands)</div><canvas class="chart" id="c-cave"></canvas></div>`;
+  chart('c-cave', st.series.cave, '#9cf', 4, occN.slice(0, CVs.length).reduce((a, b) => a + b, 0), 0);
   const X = s.foodx;
   $('food-cards').innerHTML = [
     card('Picked up', X.pickups, 'food items lifted'), card('Dropped', X.drops, X.rotted + ' rotted away'),

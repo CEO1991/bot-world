@@ -1,6 +1,6 @@
 /* Catch-up worker: advances a saved world to the shared "now" off the main thread, reporting progress.
  * Same sim.js/stats.js as the page, so the result is identical to catching up on the main thread. */
-importScripts('stats.js?v=9', 'sim.js?v=9');
+importScripts('stats.js?v=10', 'sim.js?v=10');
 self.onmessage = function (e) {
   var w = self.BotSim.deserialize(e.data.state), start = w.tick;
   function chunk() {
