@@ -69,9 +69,10 @@
       var tot = 0; for (var i = 0; i < w.bots.length; i++) tot += w.bots[i].energy;
       se.t.push(w.tick); se.alive.push(w.bots.length); se.grass.push(w.grass.length);
       se.energy.push(w.bots.length ? r1(tot / w.bots.length) : 0);
-      if (se.t.length > LIMITS.seriesPoints) {          // downsample: keep every other point, halve resolution
-        ['t', 'alive', 'grass', 'energy'].forEach(function (k) { se[k] = se[k].filter(function (_, j) { return j % 2 === 0; }); });
-        se.interval *= 2;
+      if (se.t.length > LIMITS.seriesPoints) {          // downsample: halve resolution
+        se.interval *= 2;                                   // keep only samples aligned to the new interval
+        var keep = se.t.map(function (t) { return t % se.interval === 0; });
+        ['t', 'alive', 'grass', 'energy'].forEach(function (k) { se[k] = se[k].filter(function (_, j) { return keep[j]; }); });
       }
     }
   };
