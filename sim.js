@@ -38,22 +38,33 @@
     // brain
     thinkEvery: 14,            // each bot thinks every 1.4 sim seconds (staggered; 0.14 real s at 10x); must stay even; forces apply every tick
     // reproduction (brain's reproduce output must be > 0 too)
-    maxPop: 30, reproEnergy: 0.5, reproMinAge: 3000, reproCooldown: 9000, reproCost: 0.45, childEnergy: 0.35,
+    maxPop: 30, reproEnergy: 0.5, reproMinAge: 3000, reproCooldown: 9000, reproCost: 0.45, childEnergy: 0.5,
     mutRate: 0.08, mutSd: 0.25, bigMutChance: 0.04, bigMutSd: 0.6, wMax: 4,
-    hallOfFame: 4, resproutDelayTicks: 50, pairSize: 2
+    hallOfFame: 4, resproutDelayTicks: 50, pairSize: 2,
+    // ---- lifetime learning & heritage (switches exist for control experiments) ----
+    learning: true,            // reward-modulated plastic layer on the output weights
+    inherit: true,             // children receive teach-fraction of the parent's learned deltas
+    apprentice: true,          // children sense their parent and imitate it while young
+    landmarkSense: true,       // bots sense family landmarks
+    deltaUnit: 4000,           // learned deltas are ints: 4000 = 1.0 weight; bounded to +-1.0
+    apprenticeTicks: 12000,    // childhood (imitation possible): first 20 sim minutes
+    imitateRadius: 120, imitateRate: 0.03, parentRange: 400,
+    landmarkMax: 3, landmarkRange: 400, landmarkDecay: 144000, landmarkRefresh: 30, landmarkMinGap: 80, landmarkCooldown: 6000, landmarkCost: 5
   };
 
-  var TRAITS = ['speed', 'vision', 'size'];
-  var DEFAULT_TRAITS = { speed: 4, vision: 150, size: 14 };
-  var TRAIT_RULES = { speed: { sd: 0.25, min: 1, max: 8 }, vision: { sd: 10, min: 40, max: 320 }, size: { sd: 0.8, min: 8, max: 24 } };
+  var TRAITS = ['speed', 'vision', 'size', 'learn', 'teach'];
+  var DEFAULT_TRAITS = { speed: 4, vision: 150, size: 14, learn: 0.05, teach: 0.2 };
+  var TRAIT_RULES = { speed: { sd: 0.25, min: 1, max: 8 }, vision: { sd: 10, min: 40, max: 320 }, size: { sd: 0.8, min: 8, max: 24 },
+                     learn: { sd: 0.01, min: 0, max: 0.3 }, teach: { sd: 0.03, min: 0, max: 0.5 } };
 
   var INPUTS = ['energy', 'grassNear', 'grassSide', 'grassAhead', 'botNear', 'botSide', 'botAhead', 'botEnergy', 'botKin',
                 'crowd', 'seasonSin', 'seasonCos', 'abundance', 'age', 'memory', 'warmth',
                 'onWater', 'elevation', 'fertilityAhead', 'slopeAhead', 'carrying',
-                'signalSide', 'signalAhead', 'signal1', 'signal2', 'speed', 'bias'];
-  var OUTPUTS = ['turn', 'thrust', 'reproduce', 'memory', 'signal1', 'signal2', 'pickUp', 'drop', 'eatCarried'];
+                'signalSide', 'signalAhead', 'signal1', 'signal2', 'speed',
+                'markSide', 'markAhead', 'markNear', 'foreignMark', 'parentSide', 'parentAhead', 'parentNear', 'parentAlive', 'bias'];
+  var OUTPUTS = ['turn', 'thrust', 'reproduce', 'memory', 'signal1', 'signal2', 'pickUp', 'drop', 'eatCarried', 'mark'];
   var NI = INPUTS.length, NH = 8, NO = OUTPUTS.length;
-  var NW = NI * NH + (NH + 1) * NO;
+  var NW = NI * NH + (NH + 1) * NO, ND = (NH + 1) * NO;   // ND = size of the plastic (learned) layer
 
   // Deterministic 64-direction table.
   var DIRS = 64, DX = [], DY = [];
@@ -75,7 +86,7 @@
   function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
   function tanh(x) { if (x > 3) return 1; if (x < -3) return -1; var x2 = x * x; return x * (27 + x2) / (27 + 9 * x2); }
 
-  var VERSION = 7;
+  var VERSION = 8;
   var H = Stats.hooks;
   var PAIR = [{ name: 'Blue', hue: 195 }, { name: 'Orange', hue: 25 }];
 
@@ -219,17 +230,21 @@
   function canonBot(o) {
     var t = o.traits;
     return { id: o.id, name: o.name, gen: o.gen, parent: o.parent, lineage: o.lineage, hue: o.hue,
-             traits: { speed: t.speed, vision: t.vision, size: t.size }, brain: o.brain,
+             traits: { speed: t.speed, vision: t.vision, size: t.size, learn: t.learn, teach: t.teach }, brain: o.brain,
              x: o.x, y: o.y, px: o.px === undefined ? o.x : o.px, py: o.py === undefined ? o.y : o.py, hx: o.hx, hy: o.hy, vx: o.vx, vy: o.vy,
              energy: o.energy, born: o.born, lastRepro: o.lastRepro, kids: o.kids, th: o.th, tu: o.tu, want: o.want, mem: o.mem, s1: o.s1, s2: o.s2,
              pick: o.pick, drop: o.drop, eatC: o.eatC, carry: o.carry, warm: o.warm, bx: o.bx, by: o.by, k0: o.k0 === undefined ? -1 : o.k0,
-             eaten: o.eaten || 0, gained: o.gained || 0, spent: o.spent || 0, era: o.era || 0, hr: o.hr || [0, 0, 0, 0, 0], shared: o.shared || 0, cached: o.cached || 0 };
+             D: o.D || zeros(ND), ph: o.ph || zeros(NH + 1), po: o.po || zeros(NO), rw: o.rw || 0, rb: o.rb || 0, lastMark: o.lastMark === undefined ? -1e9 : o.lastMark,
+             eaten: o.eaten || 0, gained: o.gained || 0, spent: o.spent || 0, era: o.era || 0, hr: o.hr || [0, 0, 0, 0, 0], shared: o.shared || 0, cached: o.cached || 0,
+             e1: o.e1 || 0, e2: o.e2 || 0, inh: o.inh || 0, apN: o.apN || 0, apS: o.apS || 0, y15: o.y15 || 0, imit: o.imit || 0 };
+  }
+  function zeros(n) { var a = []; for (var i = 0; i < n; i++) a.push(0); return a;
   }
   function makeBot(w, o) {
     var b = canonBot({ id: w.nextId++, name: o.name, gen: o.gen || 1, parent: o.parent || null, lineage: o.lineage || null,
               hue: o.hue, traits: o.traits, brain: o.brain, x: o.x, y: o.y, px: o.x, py: o.y, hx: 0, hy: 0, vx: 0, vy: 0,
               energy: 0, born: w.tick, lastRepro: w.tick, kids: 0, th: 0, tu: 0, want: 0, mem: 0, s1: 0, s2: 0,
-              pick: 0, drop: 0, eatC: 0, carry: [], warm: 0, bx: o.x, by: o.y });
+              pick: 0, drop: 0, eatC: 0, carry: [], warm: 0, bx: o.x, by: o.y, D: o.D });
     if (!b.lineage) b.lineage = b.id;
     b.energy = o.energy === undefined ? maxEnergy(b) : o.energy;
     var d = randInt(w, 0, DIRS - 1); b.hx = DX[d]; b.hy = DY[d];
@@ -273,8 +288,8 @@
   }
 
   function createWorld(seed, startTime) {
-    var w = { version: VERSION, seed: seed >>> 0, rng: seed >>> 0, terrainSeed: (seed ^ 0x9E3779B9) >>> 0, startTime: startTime, clocks: [{ t0: startTime, tick0: 0, rate: CONFIG.clockRate }], tick: 0, nextId: 1,
-              bots: [], grass: [], natural: 0, dropped: 0, hof: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
+    var w = { version: VERSION, seed: seed >>> 0, rng: seed >>> 0, terrainSeed: (seed ^ 0x9E3779B9) >>> 0, startTime: startTime, clocks: [{ t0: startTime, tick0: 0, rate: CONFIG.clockRate }], jumpTicks: 0, tick: 0, nextId: 1,
+              bots: [], grass: [], landmarks: [], natural: 0, dropped: 0, hof: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
     Stats.event(w, 'world', 'World created');
     for (var i = 0; i < CONFIG.startGrass; i++) spawnGrass(w);
     freshPair(w, 'first pair');
@@ -282,16 +297,19 @@
   }
 
   // ---------------- brain: sense -> think ----------------
-  var NZ = new Int32Array(NI), PERC = { E: 0, grassAhead: null, other: null, temp: 0, bank: 0, tile: 0, warm: 0 };
+  var NZ = new Int32Array(NI), PERC = { E: 0, grassAhead: null, other: null, temp: 0, bank: 0, tile: 0, warm: 0, par: null, parD: 0, young: false, age: 0, adults: 0, adultsNear: 0, ownD: null };
   var IN = new Float64Array(NI), HID = new Float64Array(NH + 1), OUT = new Float64Array(NO);
   function think(w, b, info, T) {
     var Tr = b.traits, V = Tr.vision, vis2 = V * V, hx = b.hx, hy = b.hy, bx = b.x, by = b.y, i, j;
     var G = w.grass, g = null, gd = vis2;
     for (i = 0; i < G.length; i++) { var q = G[i], dx = q.x - bx; if (dx > V || dx < -V) continue;
       var dy = q.y - by, d = dx * dx + dy * dy; if (d <= gd) { gd = d; g = q; } }
-    var BS = w.bots, o = null, od = vis2, crowd = 0, warmN = 0, sb = null, sbest = 0, SR = CONFIG.signalRange, R = radius(b);
+    var BS = w.bots, o = null, od = vis2, crowd = 0, warmN = 0, sb = null, sbest = 0, SR = CONFIG.signalRange, R = radius(b), par = null;
+    var age = w.tick - b.born, young = age < CONFIG.apprenticeTicks, IR2 = CONFIG.imitateRadius * CONFIG.imitateRadius, adultsNear = 0, adults = 0;
     for (i = 0; i < BS.length; i++) {
       var p = BS[i]; if (p === b) continue;
+      if (p.id === b.parent) par = p;
+      if (young && p.id !== b.parent && w.tick - p.born >= CONFIG.apprenticeTicks) { adults++; var ax = p.x - bx, ay = p.y - by; if (ax * ax + ay * ay < IR2) adultsNear++; }
       var ex = p.x - bx; if (ex > SR + V || ex < -SR - V) continue;
       var ey = p.y - by, e = ex * ex + ey * ey;
       if (e <= vis2) { crowd++; if (e < od) { od = e; o = p; } }
@@ -318,22 +336,82 @@
     if (sb) { var sl = Math.sqrt((sb.x - bx) * (sb.x - bx) + (sb.y - by) * (sb.y - by)) || 1, sx = (sb.x - bx) / sl, sy = (sb.y - by) / sl;
       IN[21] = hx * sy - hy * sx; IN[22] = hx * sx + hy * sy; IN[23] = sb.s1; IN[24] = sb.s2; }
     else { IN[21] = 0; IN[22] = 0; IN[23] = 0; IN[24] = 0; }
-    IN[25] = Math.sqrt(b.vx * b.vx + b.vy * b.vy) / Tr.speed; IN[26] = 1;
+    IN[25] = Math.sqrt(b.vx * b.vx + b.vy * b.vy) / Tr.speed;
+    // family landmarks: nearest own-lineage marker (direction + closeness) and closeness of the nearest foreign one
+    var LM = w.landmarks, own = null, ownD = Infinity, forD = Infinity, LR = CONFIG.landmarkRange;
+    for (i = 0; i < LM.length; i++) { var L = LM[i], lx = L.x - bx, ly = L.y - by, ld = lx * lx + ly * ly;
+      if (L.lin === b.lineage) { if (ld < ownD) { ownD = ld; own = L; } } else if (ld < forD) forD = ld; }
+    if (own) ownD = Math.sqrt(ownD);
+    if (CONFIG.landmarkSense && own && ownD < LR) { var ol2 = ownD || 1, mx2 = (own.x - bx) / ol2, my2 = (own.y - by) / ol2;
+      IN[26] = hx * my2 - hy * mx2; IN[27] = hx * mx2 + hy * my2; IN[28] = 1 - ownD / LR; }
+    else { IN[26] = 0; IN[27] = 0; IN[28] = 0; }
+    IN[29] = CONFIG.landmarkSense && forD < LR * LR ? 1 - Math.sqrt(forD) / LR : 0;
+    // parent (only while it is alive and within range)
+    var parD = Infinity;
+    if (par) { var pxd = par.x - bx, pyd = par.y - by; parD = Math.sqrt(pxd * pxd + pyd * pyd); }
+    if (CONFIG.apprentice && par && parD < CONFIG.parentRange) { var pl = parD || 1, qx = (par.x - bx) / pl, qy = (par.y - by) / pl;
+      IN[30] = hx * qy - hy * qx; IN[31] = hx * qx + hy * qy; IN[32] = 1 - parD / CONFIG.parentRange; IN[33] = 1; }
+    else { IN[30] = 0; IN[31] = 0; IN[32] = 0; IN[33] = 0; }
+    IN[34] = 1;
     var W = weights(b.brain), k = 0, s;
     var nz = 0; for (i = 0; i < NI; i++) if (IN[i] !== 0) NZ[nz++] = i;   // skip zero inputs (adding 0 changes nothing)
     for (j = 0; j < NH; j++) { s = 0; var base = j * NI; for (i = 0; i < nz; i++) s += IN[NZ[i]] * W[base + NZ[i]]; HID[j] = tanh(s); }
     k = NH * NI;
     HID[NH] = 1;
-    for (j = 0; j < NO; j++) { s = 0; for (i = 0; i <= NH; i++) s += HID[i] * W[k++]; OUT[j] = tanh(s); }
+    var D = b.D, DU = 1 / CONFIG.deltaUnit, dk = 0;   // output layer = genes + learned deltas
+    for (j = 0; j < NO; j++) { s = 0; for (i = 0; i <= NH; i++) s += HID[i] * (W[k++] + D[dk++] * DU); OUT[j] = tanh(s); }
+    learnStep(w, b, par, parD, young);
     b.tu = OUT[0]; b.th = OUT[1] > 0 ? OUT[1] : OUT[1] * 0.3; b.want = OUT[2]; b.mem = OUT[3]; b.s1 = OUT[4]; b.s2 = OUT[5];
     b.pick = OUT[6]; b.drop = OUT[7]; b.eatC = OUT[8];
+    landmarkStep(w, b, own, ownD, T);
     PERC.E = E; PERC.grassAhead = g ? IN[3] : null; PERC.other = o; PERC.temp = temp; PERC.bank = T.bank[k0]; PERC.tile = k0; PERC.warm = IN[15];
+    PERC.par = par; PERC.parD = parD; PERC.young = young; PERC.age = age; PERC.adults = adults; PERC.adultsNear = adultsNear; PERC.ownD = own ? ownD : null;
     H.perceive(w, b, PERC);
+  }
+
+  // ---- lifetime learning: reward-modulated Hebbian update of the plastic layer ----
+  // reward = energy gained from food since the last think minus cold/climbing losses (in grass units), relative to the
+  // bot's own running average; the update strengthens/weakens the hidden->output links that were active before the reward.
+  function learnStep(w, b, par, parD, young) {
+    var D = b.D, U = CONFIG.deltaUnit, i, j, k, v;
+    if (CONFIG.learning) {
+      var r = b.rw / CONFIG.grassEnergy, adv = r - b.rb, lr = b.traits.learn;
+      b.rb += 0.05 * (r - b.rb); b.rw = 0;
+      if (lr > 0 && adv !== 0) {
+        var g = lr * adv * U;
+        for (j = 0, k = 0; j < NO; j++) { var pj = b.po[j] * g; if (pj === 0) { k += NH + 1; continue; }
+          for (i = 0; i <= NH; i++, k++) { v = D[k] + Math.round(pj * b.ph[i]); D[k] = v > U ? U : v < -U ? -U : v; } }
+      }
+      // apprenticeship: while young and close to a living parent, nudge own actions toward the parent's last actions
+      if (CONFIG.apprentice && young && par && parD < CONFIG.imitateRadius) {
+        var amt = 0;
+        for (var q = 0; q < IMITATE.length; q++) { j = IMITATE[q]; var err = par.po[j] - OUT[j]; amt += Math.abs(err);
+          var gj = CONFIG.imitateRate * err * U;
+          for (i = 0, k = j * (NH + 1); i <= NH; i++, k++) { v = D[k] + Math.round(gj * HID[i]); D[k] = v > U ? U : v < -U ? -U : v; } }
+        H.imitate(w, b, amt);
+      }
+    }
+    for (i = 0; i <= NH; i++) b.ph[i] = Math.round(HID[i] * 100) / 100;   // remembered (rounded) for the next update
+    for (j = 0; j < NO; j++) b.po[j] = Math.round(OUT[j] * 100) / 100;
+  }
+  var IMITATE = [0, 1, 6, 7, 8];   // turn, thrust, pick up, drop, eat carried
+
+  // ---- family landmarks: a lineage marks places (max 3, oldest replaced); visits refresh, neglect makes them fade ----
+  function landmarkStep(w, b, own, ownD, T) {
+    if (own && ownD < CONFIG.landmarkRefresh + radius(b)) { if (w.tick - own.seen > 600) H.landmarkVisit(w, b, own); own.seen = w.tick; }
+    if (OUT[9] <= 0.8 || w.tick - b.lastMark < CONFIG.landmarkCooldown || (own && ownD < CONFIG.landmarkMinGap)) return;
+    var LM = w.landmarks, mine = [], i;
+    for (i = 0; i < LM.length; i++) if (LM[i].lin === b.lineage) mine.push(LM[i]);
+    if (mine.length >= CONFIG.landmarkMax) { var old = mine[0]; for (i = 1; i < mine.length; i++) if (mine[i].placed < old.placed) old = mine[i]; LM.splice(LM.indexOf(old), 1); }
+    var L = { lin: b.lineage, hue: b.hue, by: b.id, x: Math.round(b.x * 10) / 10, y: Math.round(b.y * 10) / 10, placed: w.tick, seen: w.tick };
+    LM.push(L); b.lastMark = w.tick; b.energy -= CONFIG.landmarkCost;   // marking costs a little energy
+    H.landmark(w, b, L, T.fert[tileAt(T, L.x, L.y)], T.bank[tileAt(T, L.x, L.y)]);
   }
 
   function eatItem(w, b, item, how) {
     var before = b.energy, mx = maxEnergy(b);
     b.energy = Math.min(mx, b.energy + CONFIG.grassEnergy);
+    b.rw += b.energy - before;
     H.eat(w, b, b.energy - before, CONFIG.grassEnergy - (b.energy - before), item, how);
   }
 
@@ -345,6 +423,9 @@
       if (w.tick % CONFIG.seasonTicks === 0) H.season(w, seasonInfo(w));
     },
     function growGrass(w) {
+      if (w.tick % 600 === 0 && w.landmarks.length) {   // neglected landmarks fade
+        for (var m = w.landmarks.length - 1; m >= 0; m--) if (w.tick - w.landmarks[m].seen > CONFIG.landmarkDecay) { H.landmarkGone(w, w.landmarks[m]); w.landmarks.splice(m, 1); }
+      }
       var s = seasonCached(w);
       if (rand(w) < s.spawn && w.natural < s.cap) spawnGrass(w);
       if (w.tick % 600 === 0 && w.dropped > 0) {          // dropped food slowly rots
@@ -411,7 +492,7 @@
         var c = cold + (T.water[k1] ? 0.15 : 0); if (c > 1.5) c = 1.5;
         var heat = CONFIG.coldCost * c * (1 - b.warm) * f2;
         cost = Math.max(0, cost + climb) + heat;
-        var d = Math.min(cost, b.energy); b.energy -= cost; H.spend(w, b, d, heat, climb);
+        var d = Math.min(cost, b.energy); b.energy -= cost; b.rw -= heat + (climb > 0 ? climb : 0); H.spend(w, b, d, heat, climb);
       }
     },
     function food(w) {   // touching food: pick it up (if the brain wants to and has room) or eat it (if not full)
@@ -456,7 +537,9 @@
         var m = mutateBrain(w, b.brain, false), t = mutateTraits(w, b.traits);
         var hue = Math.round((b.hue + gauss(w) * 6 + 360) % 360);
         var a = randInt(w, 0, DIRS - 1), off = radius(b) + t.size + 4;
-        var child = makeBot(w, { name: b.name, gen: b.gen + 1, parent: b.id, lineage: b.lineage, hue: hue, traits: t, brain: m.brain,
+        var inh = zeros(ND);
+        if (CONFIG.inherit && CONFIG.learning) for (var q = 0; q < ND; q++) inh[q] = Math.round(b.D[q] * b.traits.teach);   // teaching
+        var child = makeBot(w, { name: b.name, gen: b.gen + 1, parent: b.id, lineage: b.lineage, hue: hue, traits: t, brain: m.brain, D: inh,
                                  x: clamp(b.x + DX[a] * off, t.size, CONFIG.width - t.size), y: clamp(b.y + DY[a] * off, t.size, CONFIG.height - t.size),
                                  why: 'child of #' + b.id, energy: 0 });
         child.energy = CONFIG.childEnergy * maxEnergy(child);
@@ -487,10 +570,11 @@
     if (c) for (var i = c.length - 1; i >= 0; i--) if (timeMs >= c[i].t0) { seg = c[i]; break; }
     return seg || { t0: w.startTime, tick0: 0, rate: 1 };
   }
-  function tickAtF(w, timeMs) { var s = clockSeg(w, timeMs); return s.tick0 + (timeMs - s.t0) * s.rate / CONFIG.tickMs; }
+  // world tick = base tick (from real time and the clock segments) + jumpTicks (owner fast-forwards, cumulative)
+  function tickAtF(w, timeMs) { var s = clockSeg(w, timeMs); return s.tick0 + (timeMs - s.t0) * s.rate / CONFIG.tickMs + (w.jumpTicks || 0); }
   function tickAt(w, timeMs) { return Math.floor(tickAtF(w, timeMs)); }
   function timeOfTick(w, tick) {   // real ms at which the shared world reaches this tick
-    var c = w.clocks, seg = null;
+    var c = w.clocks, seg = null; tick -= w.jumpTicks || 0;
     if (c) for (var i = c.length - 1; i >= 0; i--) if (tick >= c[i].tick0) { seg = c[i]; break; }
     seg = seg || { t0: w.startTime, tick0: 0, rate: 1 };
     return seg.t0 + (tick - seg.tick0) * CONFIG.tickMs / seg.rate;
@@ -499,8 +583,12 @@
   function setClockRate(w, rate) {   // from the world's current tick on, run at `rate`; earlier ticks keep their old timing
     var t0 = timeOfTick(w, w.tick);
     if (!w.clocks) w.clocks = [];
-    w.clocks.push({ t0: t0, tick0: w.tick, rate: rate });
+    w.clocks.push({ t0: t0, tick0: w.tick - (w.jumpTicks || 0), rate: rate });
     Stats.event(w, 'world', 'World clock now runs at ' + rate + 'x real time');
+  }
+  function addJump(w, ticks) {   // permanently move the shared world ahead (the caller then advances it)
+    w.jumpTicks = (w.jumpTicks || 0) + ticks;
+    Stats.event(w, 'world', 'The owner fast-forwarded the world by ' + formatDuration(ticks * CONFIG.tickMs));
   }
   function advanceToTick(w, tick, maxSteps) {
     var n = 0;
@@ -523,7 +611,7 @@
   function decodeBrain(str) { var g = []; for (var i = 0; i < str.length; i += 2) g.push(ALPHA.indexOf(str[i]) * 91 + ALPHA.indexOf(str[i + 1]) - 4000); return g; }
   function serialize(w) {
     var copy = JSON.parse(JSON.stringify(w)); delete copy.config; Stats.compact(copy);
-    copy.bots.forEach(function (b) { b.brain = encodeBrain(b.brain); delete b.px; delete b.py; delete b.k0; });
+    copy.bots.forEach(function (b) { b.brain = encodeBrain(b.brain); b.D = encodeBrain(b.D); delete b.px; delete b.py; delete b.k0; });
     copy.hof.forEach(function (h) { h.brain = encodeBrain(h.brain); });
     copy.savedAt = new Date(timeOfTick(w, w.tick)).toISOString();
     return JSON.stringify(copy);
@@ -531,14 +619,14 @@
   function deserialize(text) {
     var w = typeof text === 'string' ? JSON.parse(text) : text; w.config = CONFIG;
     if (w.version !== VERSION) return w;
-    w.bots = w.bots.map(function (b) { if (typeof b.brain === 'string') b.brain = decodeBrain(b.brain); return canonBot(b); });
+    w.bots = w.bots.map(function (b) { if (typeof b.brain === 'string') b.brain = decodeBrain(b.brain); if (typeof b.D === 'string') b.D = decodeBrain(b.D); return canonBot(b); });
     w.hof.forEach(function (h) { if (typeof h.brain === 'string') h.brain = decodeBrain(h.brain); });
     return w;
   }
   function terrain(w) { return rt(w).terrain; }
 
   var api = { VERSION: VERSION, CONFIG: CONFIG, RULES: RULES, TRAITS: TRAITS, TRAIT_RULES: TRAIT_RULES, DEFAULT_TRAITS: DEFAULT_TRAITS,
-              INPUTS: INPUTS, OUTPUTS: OUTPUTS, NH: NH, NW: NW, createWorld: createWorld, step: step, advanceTo: advanceTo, advanceToTick: advanceToTick, tickAt: tickAt, tickAtF: tickAtF, timeOfTick: timeOfTick, clockRate: clockRate, setClockRate: setClockRate,
+              INPUTS: INPUTS, OUTPUTS: OUTPUTS, NH: NH, NW: NW, ND: ND, createWorld: createWorld, step: step, advanceTo: advanceTo, advanceToTick: advanceToTick, tickAt: tickAt, tickAtF: tickAtF, timeOfTick: timeOfTick, clockRate: clockRate, setClockRate: setClockRate, addJump: addJump,
               serialize: serialize, deserialize: deserialize, Stats: Stats, seasonInfo: seasonInfo, maxEnergy: maxEnergy, radius: radius,
               terrain: terrain, tileAt: tileAt, temperature: temperature, tanh: tanh, formatDuration: formatDuration, DX: DX, DY: DY, DIRS: DIRS };
   Stats.bind(api);

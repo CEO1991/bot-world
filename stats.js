@@ -23,8 +23,8 @@
   var LIMITS = { events: 80, lifespans: 30, seriesPoints: 240, sampleTicks: 600, seasonLog: 16, days: 30,
                  genMilestone: 10, patternGap: 216000, ema: 0.05, warmup: 3000, sustain: 30, decay: 0.98 };
   var SEASONS = ['Spring', 'Summer', 'Autumn', 'Winter'];
-  var TRAITS = ['speed', 'vision', 'size'];
-  var METRICS = ['chase', 'follow', 'herd', 'sprint', 'call', 'warn', 'huddle', 'cluster', 'settle', 'paths', 'cache', 'share', 'store', 'breed'];
+  var TRAITS = ['speed', 'vision', 'size', 'learn', 'teach'];
+  var METRICS = ['chase', 'follow', 'herd', 'sprint', 'call', 'warn', 'huddle', 'cluster', 'settle', 'paths', 'cache', 'share', 'store', 'breed', 'learn', 'care', 'homing'];
   var PATTERNS = {
     chase:  { th: 0.5,  text: 'learned to chase food' },
     follow: { th: 0.35, text: 'started following each other' },
@@ -38,9 +38,12 @@
     cache:  { th: 0.12, text: 'learned to cache food and come back for it' },
     share:  { th: 0.15, text: 'Sharing emerged: bots eat food that others dropped' },
     store:  { th: 0.15, text: 'Winter stores emerged: bots eat food stored before winter' },
+    learn:  { th: 9, text: 'Lifetime learning emerged: adults eat clearly more in their second 20 minutes than in their first' },
+    care:   { th: 300, text: 'Parental care emerged: children stay close to their own parent far more than to other adults' },
+    homing: { th: 9, text: 'Homing emerged: families keep returning to their landmarks' },
     breed:  { th: 2.5,  text: 'Seasonal breeding emerged: bots breed in spring/summer, hold back in autumn/winter' }
   };
-  var GLOBAL_ONLY = { herd: 1, huddle: 1, settle: 1, paths: 1, share: 1, store: 1, breed: 1 };
+  var GLOBAL_ONLY = { learn: 1, care: 1, homing: 1, herd: 1, huddle: 1, settle: 1, paths: 1, share: 1, store: 1, breed: 1 };
   var Sim = null;
   function bind(api) { Sim = api; }
   function zero(keys) { var o = {}; keys.forEach(function (m) { o[m] = 0; }); return o; }
@@ -49,7 +52,7 @@
   function newWin() { var a = newAcc(); a.warm = 0; a.wn = 0; a.bank = 0; a.bn = 0; a.ap = 0; a.an = 0; return a; }
 
   function create() {
-    var series = { interval: LIMITS.sampleTicks, t: [], alive: [], grass: [], dropped: [], energy: [], season: [], food: [], div: [], home: [] };
+    var series = { interval: LIMITS.sampleTicks, t: [], alive: [], grass: [], dropped: [], energy: [], season: [], food: [], div: [], home: [], dmag: [], lm: [] };
     TRAITS.concat(METRICS).forEach(function (k) { series[k] = []; });
     var bySeason = {}, breed = {};
     SEASONS.forEach(function (n) { bySeason[n] = { births: 0, deaths: 0, eaten: 0, ticks: 0 }; breed[n] = { elig: 0, bred: 0 }; });
@@ -64,6 +67,11 @@
       lineages: {}, oldestLineage: null,
       foodx: { pickups: 0, drops: 0, rotted: 0, carriedMeals: 0, cached: 0, shared: 0, kinShared: 0, winterEats: 0, winterFromStore: 0 },
       dec: { eats: 0, cached: 0, shared: 0, wEats: 0, wStore: 0 },   // decaying counters for rates
+      her: { imitAmt: 0, imitN: 0, feedChild: 0,
+             kids: { born: 0, surv: 0, died: 0, apS: 0, apD: 0, orS: 0, orD: 0, inS: 0, inD: 0, niS: 0, niD: 0 },
+             lg: { sum: 0, n: 0 }, lgAll: { sum: 0, n: 0, e1: 0, e2: 0 }, care: { p: 0, b: 0, n: 0 }, careAll: { p: 0, b: 0, n: 0, near: 0, ns: 0 },
+             lm: { placed: 0, fert: 0, bank: 0, visits: 0, gone: 0 }, hm: { near: 0, exp: 0 }, hmAll: { near: 0, exp: 0 },
+             winterLin: { mS: 0, mN: 0, nS: 0, nN: 0 }, wsnap: null },
       warmS: [null, null, null, null],                                // smoothed contact share (vs random placement) per season
       apS: [null, null, null, null],                                  // smoothed approach-to-nearest-bot (no food in sight) per season
       visits: [],                                                    // decaying movement counts per 50px cell
@@ -122,6 +130,8 @@
       s.botsBorn++; s.births[kind]++; s.bySeason[seasonName(w)].births++; s.season.births++;
       if (kind === 'reproduction') s.breed[seasonName(w)].bred++;
       b.eaten = 0; b.gained = 0; b.spent = 0; b.era = s.era; b.hr = [0, 0, 0, 0, 0]; b.shared = 0; b.cached = 0;
+      var dm = 0; for (var q = 0; q < b.D.length; q++) dm += Math.abs(b.D[q]); b.inh = dm / b.D.length / w.config.deltaUnit;
+      if (b.parent) s.her.kids.born++;
       if (w.bots.length > s.peakAlive) s.peakAlive = w.bots.length;
       if (w.bots.length > s.season.popMax) s.season.popMax = w.bots.length;
       var L = s.lineages[b.lineage];
@@ -135,6 +145,7 @@
       var s = S(w), X = s.foodx, D = s.dec, winter = seasonIdx(w) === 3;
       s.grassEaten++; s.winEaten++; s.energy.gained += gained; s.energy.wasted += wasted;
       s.bySeason[seasonName(w)].eaten++; s.season.eaten++; b.eaten++; b.gained += gained; D.eats++;
+      var age = w.tick - b.born; if (age < 12000) b.e1++; else if (age < 24000) b.e2++;
       if (how === 'carried') X.carriedMeals++;
       if (item.dropper && !item.corpse) {
         if (item.dropper === b.id) { X.cached++; D.cached++; b.cached++; }
@@ -143,7 +154,18 @@
       if (winter) { X.winterEats++; D.wEats++; if (stored(s, item)) { X.winterFromStore++; D.wStore++; } }
     },
     pickup: function (w) { S(w).foodx.pickups++; },
-    dropped: function (w) { S(w).foodx.drops++; },
+    dropped: function (w, b, item) {
+      var s = S(w); s.foodx.drops++;
+      for (var i = 0; i < w.bots.length; i++) { var c = w.bots[i]; if (c.parent === b.id && w.tick - c.born < w.config.apprenticeTicks) {
+        var dx = c.x - item.x, dy = c.y - item.y; if (dx * dx + dy * dy < 6400) { s.her.feedChild++; break; } } }
+    },
+    imitate: function (w, b, amt) { var H2 = S(w).her; H2.imitAmt += amt; H2.imitN++; b.imit += amt; },
+    landmark: function (w, b, L, fert, bank) {
+      var s = S(w), M = s.her.lm; M.placed++; M.fert += fert; M.bank += bank;
+      if (M.placed === 1) event(w, 'pattern', 'First family landmark placed (' + label(b) + ')');
+    },
+    landmarkVisit: function (w) { S(w).her.lm.visits++; },
+    landmarkGone: function (w) { S(w).her.lm.gone++; },
     rot: function (w) { S(w).foodx.rotted++; },
     perceive: function (w, b, p) {
       var s = S(w), follow = p.other ? b.hx * p.other.hx + b.hy * p.other.hy : null, distress = p.E < 0.3 || p.warm < 0.3;
@@ -153,6 +175,25 @@
       var L = s.lineages[b.lineage]; if (L) accAdd(L.acc, p.E, p.grassAhead, follow, b.th, b.s1, b.s2, distress);
       if (b.vx * b.vx + b.vy * b.vy > 1) { var c = Math.floor(b.y / 50) * 20 + Math.floor(b.x / 50); s.visits[c] = (s.visits[c] || 0) + 1; }
       var h = b.hr; h[0]++; h[1] += b.x; h[2] += b.y; h[3] += b.x * b.x; h[4] += b.y * b.y;
+      var Hr = s.her;
+      if (b.parent && p.age >= 1800 && p.age < w.config.apprenticeTicks) {   // childhood, after the first 3 minutes next to the birthplace
+        b.apS++;
+        if (p.par) {
+          var nearP = p.parD < w.config.imitateRadius ? 1 : 0; b.apN += nearP;
+          var base = p.adults ? p.adultsNear / p.adults : 0;
+          Hr.care.p += nearP; Hr.care.b += base; Hr.care.n++; Hr.careAll.p += nearP; Hr.careAll.b += base; Hr.careAll.n++;
+        }
+        Hr.careAll.ns++; if (p.par && p.parD < w.config.imitateRadius) Hr.careAll.near++;
+      }
+      // homing: time near own family landmarks that are at least 30 min old (so freshly dropped markers don't count),
+      // relative to the time random wandering would spend within 80 px of them
+      var nOwn = 0, best = Infinity;
+      for (var q = 0; q < w.landmarks.length; q++) { var LMq = w.landmarks[q]; if (LMq.lin !== b.lineage || w.tick - LMq.placed < 18000) continue;
+        nOwn++; var lx = LMq.x - b.x, ly = LMq.y - b.y, ld = lx * lx + ly * ly; if (ld < best) best = ld; }
+      if (nOwn) {
+        var ex = Math.min(1, nOwn * 3.1416 * 6400 / (w.config.width * w.config.height)), nr = best < 6400 ? 1 : 0;
+        Hr.hm.near += nr; Hr.hm.exp += ex; Hr.hmAll.near += nr; Hr.hmAll.exp += ex;
+      }
     },
     eligible: function (w) { S(w).breed[seasonName(w)].elig++; },
     spend: function (w, b, amount, heat, climb) { var s = S(w); s.energy.spent += amount; s.energy.heat += heat; if (climb > 0) s.energy.climb += climb; b.spent += amount; },
@@ -163,6 +204,9 @@
       if (w.bots.length < s.season.popMin) s.season.popMin = w.bots.length;
       s.lifespan.count++; s.lifespan.totalTicks += age;
       if (age > s.lifespan.maxTicks) { s.lifespan.maxTicks = age; s.lifespan.maxName = label(b); }
+      var Hr = s.her, K = Hr.kids;
+      if (age >= 24000) { Hr.lg.sum += b.e2 - b.e1; Hr.lg.n++; Hr.lgAll.sum += b.e2 - b.e1; Hr.lgAll.n++; Hr.lgAll.e1 += b.e1; Hr.lgAll.e2 += b.e2; }
+      if (b.parent && !b.y15) { K.died++; if (b.apS >= 5 && b.apN / b.apS >= 0.25) K.apD++; else K.orD++; if (b.inh > 0.002) K.inD++; else K.niD++; }
       var T = {}; TRAITS.forEach(function (k) { T[k] = r3(b.traits[k]); });
       s.lifespans.push({ id: b.id, name: b.name, gen: b.gen, era: b.era, born: b.born, died: w.tick, cause: cause, kids: b.kids, eaten: b.eaten, cached: b.cached, shared: b.shared, traits: T });
       if (s.lifespans.length > LIMITS.lifespans) s.lifespans.shift();
@@ -189,7 +233,14 @@
       event(w, 'season', c.name + ' ended: +' + c.births + ' born, -' + c.deaths + ' died, population ' + c.popStart + ' -> ' + n + '. ' + info.name + ' begins' +
             (info.strength < 0.85 ? (info.index === 3 ? ' (mild)' : ' (lean)') : info.strength > 1.15 ? (info.index === 3 ? ' (harsh)' : ' (lush)') : ''));
       s.season = { name: info.name, year: info.year, births: 0, deaths: 0, eaten: 0, popStart: n, popMin: n, popMax: n };
-      if (info.index === 3) s.winterStart = w.tick;
+      if (info.index === 0 && s.her.wsnap) {   // winter just ended: did lineages with landmarks survive it more often?
+        var WL = s.her.winterLin; s.her.wsnap.forEach(function (x) { var alive = !!s.lineages[x[0]]; if (x[1]) { WL.mN++; if (alive) WL.mS++; } else { WL.nN++; if (alive) WL.nS++; } });
+        s.her.wsnap = null;
+      }
+      if (info.index === 3) {
+        s.winterStart = w.tick;
+        s.her.wsnap = Object.keys(s.lineages).map(function (k) { var lin = +k, has = 0; w.landmarks.forEach(function (L) { if (L.lin === lin) has = 1; }); return [lin, has]; });
+      }
       if (info.index === 0) for (var k in s.breed) { s.breed[k].elig *= 0.5; s.breed[k].bred *= 0.5; }
     },
     tick: function (w, T) {
@@ -232,6 +283,14 @@
       var Dc = s.dec; decay(Dc, LIMITS.decay);
       v.cache = Dc.eats >= 20 ? Dc.cached / Dc.eats : null; v.share = Dc.eats >= 20 ? Dc.shared / Dc.eats : null;
       v.store = Dc.wEats >= 10 ? Dc.wStore / Dc.wEats : null;
+      // learning & heritage
+      var Hr = s.her, K = Hr.kids, dmag = 0;
+      for (i = 0; i < n; i++) { var bb = w.bots[i], dq = 0; for (j = 0; j < bb.D.length; j++) dq += Math.abs(bb.D[j]); dmag += dq / bb.D.length / w.config.deltaUnit;
+        if (bb.parent && !bb.y15 && w.tick - bb.born >= 9000) { bb.y15 = 1; K.surv++; if (bb.apS >= 5 && bb.apN / bb.apS >= 0.25) K.apS++; else K.orS++; if (bb.inh > 0.002) K.inS++; else K.niS++; } }
+      decay(Hr.lg, 0.995); decay(Hr.care, LIMITS.decay); decay(Hr.hm, LIMITS.decay);
+      v.learn = Hr.lg.n >= 5 ? Hr.lg.sum / Hr.lg.n : null;
+      v.care = Hr.care.n >= 30 && Hr.care.b > 0.5 ? Hr.care.p / Hr.care.b : null;
+      v.homing = Hr.hm.exp > 2 ? Hr.hm.near / Hr.hm.exp : null;
       v.herd = herd;
       s.emaN++;
       METRICS.forEach(function (m) { if (m !== 'breed' && m !== 'huddle' && m !== 'cluster' && v[m] !== null && v[m] !== undefined) s.ema[m] = s.ema[m] === null ? v[m] : s.ema[m] + k * (v[m] - s.ema[m]); });
@@ -259,7 +318,7 @@
       var se = s.series;
       if (w.tick % se.interval !== 0) return;
       se.t.push(w.tick); se.alive.push(n); se.grass.push(w.natural); se.dropped.push(w.dropped); se.energy.push(n ? Math.round(100 * e / n) : 0);
-      se.season.push(si); se.food.push(food === null ? null : Math.round(food * 10) / 10); se.div.push(r3(div)); se.home.push(hn ? Math.round(home / hn) : null);
+      se.season.push(si); se.food.push(food === null ? null : Math.round(food * 10) / 10); se.div.push(r3(div)); se.home.push(hn ? Math.round(home / hn) : null); se.dmag.push(n ? r3(dmag / n) : null); se.lm.push(w.landmarks.length);
       TRAITS.forEach(function (t) { se[t].push(n ? r3(sums[t] / n) : null); });
       METRICS.forEach(function (m) { se[m].push(r3(s.ema[m])); });
       if (se.t.length > LIMITS.seriesPoints) {
@@ -290,7 +349,7 @@
       deaths: s.deaths, grassSpawned: s.grassSpawned, grassEaten: s.grassEaten, grassNow: w.natural, droppedNow: w.dropped, maxGen: s.maxGen,
       avgLifeMs: L.count ? L.totalTicks / L.count * tm : 0, maxLifeMs: L.maxTicks * tm, maxLifeName: L.maxName,
       energy: s.energy, peakAlive: s.peakAlive, bySeason: s.bySeason, oldestLiving: oldestLiving(w), oldestEver: s.oldestLineage,
-      lineagesAlive: Object.keys(s.lineages).length, ema: s.ema, patterns: s.patterns, daily: s.daily.map(dayValues), foodx: s.foodx
+      lineagesAlive: Object.keys(s.lineages).length, her: s.her, ema: s.ema, patterns: s.patterns, daily: s.daily.map(dayValues), foodx: s.foodx
     };
   }
   return { LIMITS: LIMITS, SEASONS: SEASONS, METRICS: METRICS, PATTERNS: PATTERNS, bind: bind, create: create, hooks: hooks, event: event,

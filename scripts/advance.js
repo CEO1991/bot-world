@@ -25,6 +25,19 @@ if (Sim.clockRate(world) !== Sim.CONFIG.clockRate) {
   Sim.setClockRate(world, Sim.CONFIG.clockRate);
   Sim.advanceTo(world, now);
 }
+// Optional owner fast-forward (workflow_dispatch input jump_sim_hours; empty/0 for scheduled and routine runs).
+const jumpRaw = String(process.env.JUMP_SIM_HOURS || '0').trim();
+const jumpHours = jumpRaw === '' ? 0 : Number(jumpRaw);
+if (!isFinite(jumpHours) || jumpHours < 0 || jumpHours > 168) {
+  console.error('jump_sim_hours must be a number from 0 to 168, got: ' + JSON.stringify(jumpRaw));
+  process.exit(2);
+}
+if (jumpHours > 0) {
+  const jt = Math.round(jumpHours * 36000);   // 36000 ticks per simulated hour
+  console.log('Jumping ahead', jumpHours, 'simulated hours (' + jt + ' ticks)');
+  Sim.addJump(world, jt);
+  Sim.advanceTo(world, now);
+}
 fs.writeFileSync(file, Sim.serialize(world) + '\n');
 console.log(`Advanced ${world.tick - before} ticks in ${Date.now() - t0} ms -> tick ${world.tick}, ` +
   `sim age ${Sim.formatDuration(world.tick * Sim.CONFIG.tickMs)} at ${Sim.clockRate(world)}x, bots ${world.bots.length}, grass ${world.natural}, dropped food ${world.dropped}`);

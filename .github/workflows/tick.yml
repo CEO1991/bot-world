@@ -3,6 +3,12 @@ on:
   schedule:
     - cron: '*/20 * * * *'
   workflow_dispatch:
+    inputs:
+      jump_sim_hours:
+        description: 'Fast-forward the shared world by this many simulated hours (0-168, 0 = normal tick)'
+        required: false
+        default: '0'
+        type: string
 permissions:
   contents: write
 concurrency:
@@ -18,16 +24,19 @@ jobs:
         with:
           node-version: 20
       - name: Advance simulation and commit state (retries on push conflicts)
+        env:
+          JUMP_SIM_HOURS: ${{ github.event.inputs.jump_sim_hours || '0' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           for attempt in 1 2 3 4 5; do
             git fetch origin main
             git reset --hard origin/main
-            node scripts/advance.js
+            node scripts/advance.js || exit 1
             git add state.json
             if git diff --cached --quiet; then echo "No change"; exit 0; fi
-            git commit -m "World tick $(date -u +%Y-%m-%dT%H:%MZ)"
+            if [ "$JUMP_SIM_HOURS" != "0" ]; then MSG="World jump +${JUMP_SIM_HOURS}h sim"; else MSG="World tick"; fi
+            git commit -m "$MSG $(date -u +%Y-%m-%dT%H:%MZ)"
             if git push origin HEAD:main; then exit 0; fi
             echo "Push rejected (attempt $attempt), main moved; recomputing from the newest state"
             sleep $((attempt * 5))
