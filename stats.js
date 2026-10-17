@@ -79,7 +79,7 @@
              lm: { placed: 0, fert: 0, bank: 0, visits: 0, gone: 0 }, hm: { near: 0, exp: 0 }, hmAll: { near: 0, exp: 0 },
              winterLin: { mS: 0, mN: 0, nS: 0, nN: 0 }, wsnap: null },
       cv: { inT: [0, 0, 0, 0], botT: [0, 0, 0, 0], shT: 0, drops: [0, 0, 0, 0], meals: [0, 0, 0, 0], flags: 0, mixed: 0, solo: 0,
-            wS: { cS: 0, cD: 0, nS: 0, nD: 0 }, own: [{}, {}, {}, {}, {}], linT: {}, inS: [null, null, null, null], first: 0 },
+            wS: { cS: 0, cD: 0, nS: 0, nD: 0 }, mossGrown: [0, 0, 0, 0], mossEaten: [0, 0, 0, 0], wExt: 0, own: [{}, {}, {}, {}, {}], linT: {}, inS: [null, null, null, null], first: 0 },
       warmS: [null, null, null, null],                                // smoothed contact share (vs random placement) per season
       apS: [null, null, null, null],                                  // smoothed approach-to-nearest-bot (no food in sight) per season
       visits: [],                                                    // decaying movement counts per 50px cell
@@ -159,6 +159,7 @@
         if (item.dropper === b.id) { X.cached++; D.cached++; b.cached++; }
         else { X.shared++; D.shared++; b.shared++; if (item.dropLin === b.lineage) X.kinShared++; }
       }
+      if (item.moss) s.cv.mossEaten[seasonIdx(w)]++;
       if (item.cave && !item.corpse) { s.cv.meals[seasonIdx(w)]++; D.cave++; }
       if (winter) { X.winterEats++; D.wEats++; if (stored(s, item)) { X.winterFromStore++; D.wStore++; } }
     },
@@ -175,6 +176,7 @@
     },
     landmarkVisit: function (w) { S(w).her.lm.visits++; },
     landmarkGone: function (w) { S(w).her.lm.gone++; },
+    mossGrow: function (w) { S(w).cv.mossGrown[seasonIdx(w)]++; },
     rot: function (w) { S(w).foodx.rotted++; },
     perceive: function (w, b, p) {
       var s = S(w), follow = p.other ? b.hx * p.other.hx + b.hy * p.other.hy : null, distress = p.E < 0.3 || p.warm < 0.3;
@@ -233,7 +235,7 @@
       if (w.bots.length <= 1) event(w, 'death', label(b) + ' died of ' + cause + ' at age ' + fmt(age * w.config.tickMs) + ' (' + w.bots.length + ' left)', { bot: b.id, cause: cause, age: age });
     },
     extinction: function (w, fmt) {
-      var s = S(w); s.extinctions++; var D = s.daily[s.daily.length - 1]; if (D) D.ext++;
+      var s = S(w); s.extinctions++; if (seasonIdx(w) === 3) s.cv.wExt++; var D = s.daily[s.daily.length - 1]; if (D) D.ext++;
       event(w, 'extinction', 'Extinction #' + s.extinctions + ' in ' + seasonName(w) + ': era ' + s.era + ' ended after ' + fmt((w.tick - (s.eraStart || 0)) * w.config.tickMs));
     },
     newEra: function (w) { var s = S(w); s.era++; s.eraStart = w.tick; event(w, 'resprout', 'New life sprouted: era ' + s.era + ' begins'); },

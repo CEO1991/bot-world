@@ -56,7 +56,12 @@
     caveSense: true,           // bots sense caves (direction, closeness, crowding)
     caveRadius: 28, caveCapacity: 4, caveRange: 400,
     caveRest: 0.4,             // resting drain (base + vision) inside a cave is 40% of normal; no cold drain at all
-    caveDecayMul: 8            // food dropped inside a cave rots 8x slower (48 h instead of 6 h)
+    caveDecayMul: 8,           // food dropped inside a cave rots 8x slower (48 h instead of 6 h)
+    // ---- winter cave moss: a little low-energy food regrows inside caves in autumn and winter ----
+    moss: true,                // control: false
+    mossEnergy: 12,            // vs 25 for grass
+    mossRate: [0, 0, 0.0008, 0.0016],   // chance per tick per cave (spring, summer, autumn, winter)
+    mossCap: 3                 // at most 3 moss patches lying in a cave
   };
 
   var TRAITS = ['speed', 'vision', 'size', 'learn', 'teach'];
@@ -94,7 +99,7 @@
   function clamp(x, lo, hi) { return x < lo ? lo : x > hi ? hi : x; }
   function tanh(x) { if (x > 3) return 1; if (x < -3) return -1; var x2 = x * x; return x * (27 + x2) / (27 + 9 * x2); }
 
-  var VERSION = 9;
+  var VERSION = 10;
   var H = Stats.hooks;
   var PAIR = [{ name: 'Blue', hue: 195 }, { name: 'Orange', hue: 25 }];
 
@@ -193,10 +198,10 @@
   var HEAD = new Int32Array(GW * GH), NEXT = new Int32Array(64), CI = new Int32Array(64), FWD_X = [0, 1, -1, 0, 1], FWD_Y = [0, 0, 1, 1, 1];
   function cellOf(x, y) { var cx = Math.floor(x / CELL), cy = Math.floor(y / CELL); if (cx < 0) cx = 0; if (cy < 0) cy = 0; if (cx >= GW) cx = GW - 1; if (cy >= GH) cy = GH - 1; return cy * GW + cx; }
   function foodGridBuild(w) { var g = []; for (var i = 0; i < GW * GH; i++) g.push([]); for (i = 0; i < w.grass.length; i++) g[cellOf(w.grass[i].x, w.grass[i].y)].push(w.grass[i]); return g; }
-  function addFood(w, f) { w.grass.push(f); rt(w).food[cellOf(f.x, f.y)].push(f); if (f.drop) w.dropped++; else w.natural++; }
+  function addFood(w, f) { w.grass.push(f); rt(w).food[cellOf(f.x, f.y)].push(f); if (f.drop) w.dropped++; else if (f.moss) w.mossN++; else w.natural++; }
   function removeFood(w, f) {
     var c = rt(w).food[cellOf(f.x, f.y)]; c.splice(c.indexOf(f), 1);
-    w.grass.splice(w.grass.indexOf(f), 1); if (f.drop) w.dropped--; else w.natural--;
+    w.grass.splice(w.grass.indexOf(f), 1); if (f.drop) w.dropped--; else if (f.moss) w.mossN--; else w.natural--;
   }
 
   // ---------------- bodies ----------------
@@ -316,7 +321,7 @@
 
   function createWorld(seed, startTime) {
     var w = { version: VERSION, seed: seed >>> 0, rng: seed >>> 0, terrainSeed: (seed ^ 0x9E3779B9) >>> 0, startTime: startTime, clocks: [{ t0: startTime, tick0: 0, rate: CONFIG.clockRate }], jumpTicks: 0, tick: 0, nextId: 1,
-              bots: [], grass: [], landmarks: [], natural: 0, dropped: 0, hof: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
+              bots: [], grass: [], landmarks: [], natural: 0, dropped: 0, mossN: 0, hof: [], resproutAt: null, yearStrength: 1, year: 0, stats: Stats.create(), config: CONFIG };
     Stats.event(w, 'world', 'World created');
     for (var i = 0; i < CONFIG.startGrass; i++) spawnGrass(w);
     freshPair(w, 'first pair');
@@ -444,10 +449,10 @@
 
   function caveNear(C, x, y) { var R = CONFIG.caveRadius + 40; for (var i = 0; i < C.length; i++) { var dx = C[i].x - x, dy = C[i].y - y; if (dx * dx + dy * dy < R * R) return 1; } return 0; }
   function eatItem(w, b, item, how) {
-    var before = b.energy, mx = maxEnergy(b);
-    b.energy = Math.min(mx, b.energy + CONFIG.grassEnergy);
+    var before = b.energy, mx = maxEnergy(b), en = item.moss ? CONFIG.mossEnergy : CONFIG.grassEnergy;
+    b.energy = Math.min(mx, b.energy + en);
     b.rw += b.energy - before;
-    H.eat(w, b, b.energy - before, CONFIG.grassEnergy - (b.energy - before), item, how);
+    H.eat(w, b, b.energy - before, en - (b.energy - before), item, how);
   }
 
   // ---------------- rules ----------------
@@ -463,6 +468,18 @@
       }
       var s = seasonCached(w);
       if (rand(w) < s.spawn && w.natural < s.cap) spawnGrass(w);
+      var mr = CONFIG.mossRate[s.index];
+      if (CONFIG.moss && mr > 0) {   // moss regrows slowly inside caves (only on the ground, capped per cave)
+        var CV = cavesOf(rt(w).terrain);
+        for (var c = 0; c < CV.length; c++) {
+          if (rand(w) >= mr) continue;
+          var have = 0; for (var q = 0; q < w.grass.length; q++) if (w.grass[q].moss && !w.grass[q].drop && w.grass[q].mc === c) have++;
+          if (have >= CONFIG.mossCap) continue;
+          var a = randInt(w, 0, DIRS - 1), rr = rand(w) * (CONFIG.caveRadius - 10);
+          addFood(w, { id: w.nextId++, x: CV[c].x + DX[a] * rr, y: CV[c].y + DY[a] * rr, born: w.tick, moss: 1, mc: c });
+          H.mossGrow(w);
+        }
+      }
       if (w.tick % 600 === 0 && w.dropped > 0) {          // dropped food slowly rots
         for (var i = w.grass.length - 1; i >= 0; i--) { var f = w.grass[i]; if (f.drop && w.tick >= f.rotAt) { removeFood(w, f); H.rot(w, f); } }
       }
@@ -550,7 +567,7 @@
             var dx = f.x - b.x, dy = f.y - b.y; if (dx * dx + dy * dy >= r2) continue;
             if (f.drop && f.dropper === b.id && w.tick - f.dropTick < CONFIG.ownDropGrace) continue;
             if (b.pick > 0.5 && b.carry.length < CONFIG.maxCarry) {
-              removeFood(w, f); b.carry.push({ id: f.id, born: f.born, picked: w.tick, dropper: f.dropper || null, dropLin: f.dropLin || null, dropTick: f.dropTick || null, corpse: f.corpse || 0, cave: f.cave || 0 });
+              removeFood(w, f); b.carry.push({ id: f.id, born: f.born, picked: w.tick, dropper: f.dropper || null, dropLin: f.dropLin || null, dropTick: f.dropTick || null, corpse: f.corpse || 0, cave: f.cave || 0, moss: f.moss || 0 });
               H.pickup(w, b, f);
             } else if (b.energy < mx - 1) { removeFood(w, f); eatItem(w, b, f, f.drop ? 'ground-drop' : 'ground'); }
           }
@@ -563,7 +580,7 @@
           var fx = clamp(b.x - b.hx * (radius(b) + gr + 2), gr, CONFIG.width - gr), fy = clamp(b.y - b.hy * (radius(b) + gr + 2), gr, CONFIG.height - gr);
           var inC = caveAt(cavesOf(rt(w).terrain), fx, fy);   // food left inside a cave keeps much longer
           var dropped = { id: c2.id, x: fx, y: fy, born: c2.born, drop: 1, dropper: b.id, dropLin: b.lineage, dropTick: w.tick,
-                          rotAt: w.tick + CONFIG.dropDecayTicks * (inC >= 0 ? CONFIG.caveDecayMul : 1), picked: c2.picked, cave: inC >= 0 ? inC + 1 : 0 };
+                          rotAt: w.tick + CONFIG.dropDecayTicks * (inC >= 0 ? CONFIG.caveDecayMul : 1), picked: c2.picked, cave: inC >= 0 ? inC + 1 : 0, moss: c2.moss || 0 };
           addFood(w, dropped); H.dropped(w, b, dropped);
         }
       }
@@ -595,7 +612,7 @@
           w.bots.splice(i, 1);
           for (var c = 0; c < b.carry.length; c++) {        // carried food falls to the ground
             var it = b.carry[c], gr = CONFIG.grassRadius;
-            if (w.dropped < CONFIG.maxDropped) addFood(w, { id: it.id, x: clamp(b.x, gr, CONFIG.width - gr), y: clamp(b.y, gr, CONFIG.height - gr), born: it.born, drop: 1, dropper: b.id, dropLin: b.lineage, dropTick: w.tick, rotAt: w.tick + CONFIG.dropDecayTicks, picked: it.picked, corpse: 1 });
+            if (w.dropped < CONFIG.maxDropped) addFood(w, { id: it.id, x: clamp(b.x, gr, CONFIG.width - gr), y: clamp(b.y, gr, CONFIG.height - gr), born: it.born, drop: 1, dropper: b.id, dropLin: b.lineage, dropTick: w.tick, rotAt: w.tick + CONFIG.dropDecayTicks, picked: it.picked, corpse: 1, moss: it.moss || 0 });
           }
           remember(w, b);
           H.death(w, b, 'starvation', formatDuration);
